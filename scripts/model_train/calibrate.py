@@ -1,26 +1,19 @@
-import os
-from dotenv import load_dotenv
-import pandas as pd
-from sqlalchemy import create_engine, text
+# scripts/calibrate.py
+from joblib import load, dump
+import numpy as np
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import brier_score_loss
+from fetch_data import fetch_matches
+from features import build_feature_matrix
 
-load_dotenv()
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError("Set DATABASE_URL in .env")
-
-engine = create_engine(DATABASE_URL, future=True)
-
-def fetch_matches(min_date=None):
-    sql = "SELECT * FROM public.matches WHERE date IS NOT NULL ORDER BY date"
-    params = {}
-    if min_date:
-        sql = "SELECT * FROM public.matches WHERE date >= :min_date ORDER BY date"
-        params["min_date"] = min_date
-    with engine.connect() as conn:
-        df = pd.read_sql(text(sql), conn, params=params)
-    return df
-
-if __name__ == "__main__":
+def main(model_path):
     df = fetch_matches()
-    print(f"Rows fetched: {len(df)}")
-    print(df.columns.tolist())
+    X, y, meta = build_feature_matrix(df)
+    # split a small holdout for calibration (time-aware ideally)
+    X_train, X_cal, y_train, y_cal = train_test_split(X, y, test_size=0.2, shuffle=False)
+    base = load(model_path)
+    calib = CalibratedClassifierCV(base, method='isotonic', cv='prefit')
+    calib.fit(X_cal, y_cal)
+    dump(calib, model_path.replace('.joblib','_calib.joblib'))
+    print("Saved calibrated model")
