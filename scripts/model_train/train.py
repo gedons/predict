@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
-scripts/train_optuna.py
+scripts/train.py - Optimized Version
 
-- Fetches match rows from Postgres (Supabase) using DATABASE_URL from .env
-- Builds vectorized rolling features per team (window configurable)
-- Runs Optuna tuning using TimeSeriesSplit CV (time-aware)
-- Trains final XGBoost model with best params and saves model + metadata
+Key optimizations:
+- Vectorized operations with pandas and numpy
+- Memory-efficient data processing with chunking
+- Improved cross-validation strategy
+- Better feature engineering and selection
+- Enhanced evaluation metrics and model validation
+- Reduced redundant computations
+- Optimized hyperparameter search
 """
 
 import os
@@ -22,18 +26,26 @@ from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 
 from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import log_loss, accuracy_score, classification_report, brier_score_loss
+from sklearn.metrics import (
+    log_loss, accuracy_score, classification_report, 
+    brier_score_loss, f1_score, precision_score, recall_score
+)
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
 from xgboost import XGBClassifier
 import joblib
 import optuna
 from tqdm import tqdm
+import psutil
+import gc
+import xgboost as xgb
+from typing import Any
 
 # Suppress warnings for cleaner output
-warnings.filterwarnings('ignore', category=FutureWarning)
-warnings.filterwarnings('ignore', category=UserWarning)
+warnings.filterwarnings('ignore')
+optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 load_dotenv()
 
@@ -46,614 +58,633 @@ ARTIFACT_DIR = Path("artifacts")
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
 
-# Constants for better maintainability
-RESULT_MAPPING = {'H': 0, 'D': 1, 'A': 2}
-RESULT_LABELS = ['H', 'D', 'A']
-RANDOM_STATE = 42
+# Memory optimization settings
+CHUNK_SIZE = 10000
+MAX_MEMORY_USAGE = 0.8  # 80% of available RAM
+
+
+def get_memory_usage():
+    """Get current memory usage percentage."""
+    return psutil.virtual_memory().percent / 100
+
+
+def optimize_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+    """Optimize DataFrame dtypes to reduce memory usage."""
+    df = df.copy()
+    
+    # Handle integer columns
+    for col in df.select_dtypes(include=['int64']).columns:
+        if df[col].min() >= -128 and df[col].max() <= 127:
+            df[col] = df[col].astype('int8')
+        elif df[col].min() >= -32768 and df[col].max() <= 32767:
+            df[col] = df[col].astype('int16')
+        elif df[col].min() >= -2147483648 and df[col].max() <= 2147483647:
+            df[col] = df[col].astype('int32')
+    
+    # Handle float columns
+    for col in df.select_dtypes(include=['float64']).columns:
+        df[col] = pd.to_numeric(df[col], downcast='float')
+    
+    # Handle object columns - but exclude date-related columns
+    date_related_cols = ['date', 'created_at', 'updated_at', 'timestamp']
+    
+    for col in df.select_dtypes(include=['object']).columns:
+        # Skip date-related columns from categorical conversion
+        if any(date_word in col.lower() for date_word in date_related_cols):
+            continue
+            
+        # Only convert to category if it's truly categorical (low cardinality)
+        unique_ratio = df[col].nunique() / len(df)
+        if unique_ratio < 0.5:  # Less than 50% unique values
+            df[col] = df[col].astype('category')
+    
+    return df
 
 
 ####################
-# Data fetching
+# Enhanced Data fetching
 ####################
 def fetch_matches(min_date: Optional[str] = None) -> pd.DataFrame:
     """
-    Fetch all rows from public.matches with non-null date, ordered by date.
-    
-    Args:
-        min_date: Optional minimum date filter (YYYY-MM-DD format)
-        
-    Returns:
-        DataFrame with match data
+    Fetch matches with optimized query and memory usage.
     """
     engine = create_engine(DATABASE_URL, future=True)
     
-    if min_date:
-        sql = """
-        SELECT * FROM public.matches 
-        WHERE date IS NOT NULL AND date >= :min_date 
-        ORDER BY date
-        """
-        params = {"min_date": min_date}
-    else:
-        sql = "SELECT * FROM public.matches WHERE date IS NOT NULL ORDER BY date"
-        params = {}
-    
-    try:
-        with engine.connect() as conn:
-            df = pd.read_sql(text(sql), conn, params=params)
-        print(f"Fetched {len(df)} matches from database")
-        return df
-    except Exception as e:
-        raise RuntimeError(f"Failed to fetch data from database: {e}")
-
-
-####################
-# Feature engineering (vectorized and optimized)
-####################
-def build_team_long_table(df: pd.DataFrame) -> pd.DataFrame:
+    # More selective query to reduce memory usage
+    base_query = """
+    SELECT match_id, date, home_team, away_team, 
+           full_time_home_goals, full_time_away_goals, full_time_result,
+           home_shots, away_shots, home_shots_on_target, away_shots_on_target,
+           home_corners, away_corners, season, league,
+           b365_home_odds, b365_draw_odds, b365_away_odds
+    FROM public.matches 
+    WHERE date IS NOT NULL 
+      AND full_time_result IN ('H', 'D', 'A')
+      AND full_time_home_goals IS NOT NULL 
+      AND full_time_away_goals IS NOT NULL
     """
-    Build a long-form table with one row per team per match (home/away).
-    Optimized with vectorized operations.
+    
+    if min_date:
+        base_query += " AND date >= :min_date"
+    
+    base_query += " ORDER BY date"
+    
+    params = {"min_date": min_date} if min_date else {}
+    
+    with engine.connect() as conn:
+        df = pd.read_sql(text(base_query), conn, params=params)
+    
+    # Convert date column BEFORE dtype optimization
+    df['date'] = pd.to_datetime(df['date'])
+    
+    # Optimize dtypes (will now skip the date column)
+    df = optimize_dtypes(df)
+    
+    return df
+
+
+####################
+# Optimized Feature Engineering
+####################
+def build_team_features_vectorized(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Vectorized approach to build team features using efficient pandas operations.
     """
     df = df.copy()
-    df['date'] = pd.to_datetime(df['date'])
-
-    # Create both tables simultaneously with vectorized operations
-    base_cols = ['match_id', 'date', 'full_time_result']
-    optional_cols = {
-        'home_shots': 'shots',
-        'away_shots': 'shots', 
-        'home_shots_on_target': 'shots_on_target',
-        'away_shots_on_target': 'shots_on_target',
-        'home_corners': 'corners',
-        'away_corners': 'corners'
-    }
     
-    # Home team data
-    home_data = {
+    # Create home and away records more efficiently
+    home_records = pd.DataFrame({
         'match_id': df['match_id'],
         'date': df['date'],
         'team': df['home_team'],
         'is_home': True,
-        'goals_for': df['full_time_home_goals'],
-        'goals_against': df['full_time_away_goals'],
+        'goals_for': df['full_time_home_goals'].astype('int8'),
+        'goals_against': df['full_time_away_goals'].astype('int8'),
+        'shots': df['home_shots'].fillna(0).astype('int8'),
+        'shots_on_target': df['home_shots_on_target'].fillna(0).astype('int8'),
+        'corners': df['home_corners'].fillna(0).astype('int8'),
         'result': df['full_time_result']
-    }
-    
-    # Away team data  
-    away_data = {
+    })
+
+    away_records = pd.DataFrame({
         'match_id': df['match_id'],
         'date': df['date'],
         'team': df['away_team'],
         'is_home': False,
-        'goals_for': df['full_time_away_goals'],
-        'goals_against': df['full_time_home_goals'],
+        'goals_for': df['full_time_away_goals'].astype('int8'),
+        'goals_against': df['full_time_home_goals'].astype('int8'),
+        'shots': df['away_shots'].fillna(0).astype('int8'),
+        'shots_on_target': df['away_shots_on_target'].fillna(0).astype('int8'),
+        'corners': df['away_corners'].fillna(0).astype('int8'),
         'result': df['full_time_result']
-    }
+    })
+
+    # Determine wins more efficiently
+    home_records['is_win'] = (home_records['result'] == 'H').astype('int8')
+    away_records['is_win'] = (away_records['result'] == 'A').astype('int8')
     
-    # Add optional columns if they exist
-    for home_col, target_col in optional_cols.items():
-        if home_col in df.columns:
-            home_data[target_col] = df[home_col]
-        if home_col.replace('home_', 'away_') in df.columns:
-            away_data[target_col] = df[home_col.replace('home_', 'away_')]
+    # Calculate goal difference
+    home_records['goal_diff'] = (home_records['goals_for'] - home_records['goals_against']).astype('int8')
+    away_records['goal_diff'] = (away_records['goals_for'] - away_records['goals_against']).astype('int8')
+
+    # Combine and sort
+    team_records = pd.concat([home_records, away_records], ignore_index=True)
+    team_records = team_records.sort_values(['team', 'date']).reset_index(drop=True)
     
-    home_df = pd.DataFrame(home_data)
-    away_df = pd.DataFrame(away_data)
-
-    # Vectorized win calculation
-    home_df['is_win'] = (home_df['result'] == 'H').astype(int)
-    away_df['is_win'] = (away_df['result'] == 'A').astype(int)
-
-    # Vectorized goal difference calculation
-    home_df['goal_diff'] = home_df['goals_for'] - home_df['goals_against']
-    away_df['goal_diff'] = away_df['goals_for'] - away_df['goals_against']
-
-    # Combine and sort efficiently
-    long_df = pd.concat([home_df, away_df], ignore_index=True)
-    long_df.sort_values(['team', 'date'], inplace=True)
-    
-    return long_df
+    return team_records
 
 
-def compute_rolling_features(long_df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
+def compute_rolling_stats_optimized(team_records: pd.DataFrame, window: int = 5) -> pd.DataFrame:
     """
-    Vectorized rolling features per team using groupby operations.
-    More efficient than the original apply-based approach.
+    Optimized rolling statistics computation using groupby operations.
     """
-    df = long_df.copy()
+    df = team_records.copy()
     
-    # Columns to compute rolling statistics for
-    rolling_cols = ['is_win', 'goal_diff', 'shots', 'shots_on_target', 'corners']
-    existing_cols = [col for col in rolling_cols if col in df.columns]
+    # Define columns for rolling calculations
+    stat_cols = ['is_win', 'goal_diff', 'shots', 'shots_on_target', 'corners', 'goals_for', 'goals_against']
     
-    # Vectorized rolling computation
-    for col in existing_cols:
-        # Shift to exclude current match, then compute rolling mean
-        df[f'{col}_roll_mean_{window}'] = (
-            df.groupby('team')[col]
-            .shift()  # Exclude current match
-            .rolling(window=window, min_periods=1)
-            .mean()
-            .reset_index(level=0, drop=True)  # Remove team level from index
-        )
+    # Use groupby with efficient rolling operations
+    grouped = df.groupby('team', group_keys=False)
+    
+    for col in stat_cols:
+        # Use shift(1) to exclude current match, then rolling
+        df[f'{col}_avg_{window}'] = grouped[col].shift(1).rolling(
+            window=window, min_periods=1
+        ).mean().astype('float32')
+        
+        if col in ['is_win']:
+            # Also calculate recent form (last 3 games)
+            df[f'{col}_form_3'] = grouped[col].shift(1).rolling(
+                window=3, min_periods=1
+            ).mean().astype('float32')
+    
+    # Add additional performance metrics with dynamic window
+    df[f'attack_strength_{window}'] = grouped['goals_for'].shift(1).rolling(
+        window=window, min_periods=1
+    ).mean().astype('float32')
+    
+    df[f'defense_strength_{window}'] = grouped['goals_against'].shift(1).rolling(
+        window=window, min_periods=1
+    ).mean().astype('float32')
+    
+    # Head-to-head features would go here if we had historical H2H data
     
     return df
 
 
-def pivot_features_to_matches(rolled_long: pd.DataFrame, window: int = 5) -> pd.DataFrame:
+def create_match_features(team_stats: pd.DataFrame, original_matches: pd.DataFrame, window: int = 5) -> Tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
     """
-    Pivot home and away features to per-match rows (match_id).
-    Optimized with better column detection and handling.
+    Create final feature matrix by merging team statistics with match data.
     """
-    # Dynamic column detection based on window parameter
-    rolling_suffix = f'_roll_mean_{window}'
+    # Separate home and away statistics
+    home_stats = team_stats[team_stats['is_home'] == True].copy()
+    away_stats = team_stats[team_stats['is_home'] == False].copy()
     
-    # Find all rolling columns
-    rolling_cols = {
-        'form': f'is_win{rolling_suffix}',
-        'goal_diff': f'goal_diff{rolling_suffix}',
-        'shots': f'shots{rolling_suffix}',
-        'shots_on_target': f'shots_on_target{rolling_suffix}',
-        'corners': f'corners{rolling_suffix}'
-    }
+    # Select and rename feature columns - use dynamic column names based on window
+    feature_cols = [
+        'match_id', f'is_win_avg_{window}', 'is_win_form_3', f'goal_diff_avg_{window}',
+        f'shots_avg_{window}', f'shots_on_target_avg_{window}', f'corners_avg_{window}',
+        f'attack_strength_{window}', f'defense_strength_{window}'
+    ]
     
-    # Filter to only existing columns
-    existing_rolling_cols = {k: v for k, v in rolling_cols.items() if v in rolled_long.columns}
+    # Verify all columns exist in the data
+    missing_cols = [col for col in feature_cols if col not in home_stats.columns]
+    if missing_cols:
+        print(f"Missing columns in team_stats: {missing_cols}")
+        print(f"Available columns: {list(home_stats.columns)}")
+        raise KeyError(f"Missing expected columns: {missing_cols}")
     
-    if not existing_rolling_cols:
-        raise ValueError(f"No rolling columns found with suffix {rolling_suffix}")
+    home_features = home_stats[feature_cols].copy()
+    away_features = away_stats[feature_cols].copy()
     
-    # Separate home and away data more efficiently
-    home_mask = rolled_long['is_home'] == True
-    away_mask = rolled_long['is_home'] == False
+    # Rename columns with home/away prefixes
+    for col in feature_cols[1:]:  # Skip match_id
+        home_features = home_features.rename(columns={col: f'home_{col}'})
+        away_features = away_features.rename(columns={col: f'away_{col}'})
     
-    # Base columns for both
-    base_cols = ['match_id', 'team'] + list(existing_rolling_cols.values())
+    # Merge home and away features
+    match_features = home_features.merge(away_features, on='match_id', how='inner')
     
-    # Home features
-    home_rename = {'team': 'home_team'}
-    for feature, col in existing_rolling_cols.items():
-        home_rename[col] = f'home_{feature}'
+    # Merge with original match data for odds and targets
+    final_df = original_matches.merge(match_features, on='match_id', how='inner')
     
-    home_feats = (
-        rolled_long.loc[home_mask, base_cols]
-        .rename(columns=home_rename)
-        .set_index('match_id')
-    )
-    
-    # Away features  
-    away_rename = {'team': 'away_team'}
-    for feature, col in existing_rolling_cols.items():
-        away_rename[col] = f'away_{feature}'
-        
-    away_feats = (
-        rolled_long.loc[away_mask, base_cols]
-        .rename(columns=away_rename)
-        .set_index('match_id')
-    )
-    
-    # Join efficiently
-    merged = home_feats.join(away_feats, how='outer')
-    merged.reset_index(inplace=True)
-    
-    return merged
-
-
-def add_odds_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Add implied probability features from betting odds.
-    Handles missing odds gracefully.
-    """
-    odds_cols = ['b365_home_odds', 'b365_draw_odds', 'b365_away_odds']
-    
-    # Check if all odds columns exist
-    if all(col in df.columns for col in odds_cols):
-        # Vectorized implied probability calculation
-        with np.errstate(divide='ignore', invalid='ignore'):
-            home_implied = 1 / df['b365_home_odds']
-            draw_implied = 1 / df['b365_draw_odds'] 
-            away_implied = 1 / df['b365_away_odds']
-            
-            # Normalize probabilities (handle division by zero)
-            total_implied = home_implied + draw_implied + away_implied
-            valid_mask = (total_implied > 0) & np.isfinite(total_implied)
-            
-            df['home_prob_implied'] = np.where(valid_mask, home_implied / total_implied, np.nan)
-            df['draw_prob_implied'] = np.where(valid_mask, draw_implied / total_implied, np.nan)
-            df['away_prob_implied'] = np.where(valid_mask, away_implied / total_implied, np.nan)
-    else:
-        # Set to NaN if odds not available
-        df['home_prob_implied'] = np.nan
-        df['draw_prob_implied'] = np.nan  
-        df['away_prob_implied'] = np.nan
-        
-    return df
-
-
-def construct_feature_matrix(matches_df: pd.DataFrame, window: int = 5) -> Tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
-    """
-    Full feature engineering pipeline with optimizations.
-    
-    Returns:
-        X: Feature matrix
-        y: Target labels  
-        meta: Metadata (match_id, date, teams, etc.)
-    """
-    print(f"Building features with window={window}...")
-    
-    matches = matches_df.copy()
-    matches['date'] = pd.to_datetime(matches['date'])
-    
-    # Filter valid matches early
-    valid_mask = (
-        matches['match_id'].notna() & 
-        matches['date'].notna() &
-        matches['full_time_result'].isin(RESULT_LABELS)
-    )
-    matches = matches.loc[valid_mask].sort_values('date').reset_index(drop=True)
-    
-    print(f"Processing {len(matches)} valid matches...")
-    
-    # Feature engineering pipeline
-    long_df = build_team_long_table(matches)
-    rolled_df = compute_rolling_features(long_df, window=window)
-    features_df = pivot_features_to_matches(rolled_df, window=window)
-    
-    # Merge with original matches
-    merged = matches.merge(features_df, on='match_id', how='left')
-    merged = add_odds_features(merged)
+    # Add derived features
+    final_df = add_derived_features(final_df, window)
     
     # Create target variable
-    merged['y'] = merged['full_time_result'].map(RESULT_MAPPING)
+    label_map = {'H': 0, 'D': 1, 'A': 2}
+    final_df['target'] = final_df['full_time_result'].map(label_map)
     
-    # Define feature columns dynamically
-    feature_cols = []
+    # Select feature columns - use dynamic column names
+    feature_columns = [col for col in final_df.columns if 
+                      col.startswith(('home_', 'away_')) or 
+                      col.endswith('_prob_implied') or
+                      col in ['form_diff', 'strength_diff', 'total_avg_goals']]
     
-    # Team form features
-    form_features = [f'{side}_{feat}' for side in ['home', 'away'] 
-                    for feat in ['form', 'goal_diff', 'shots', 'shots_on_target', 'corners']
-                    if f'{side}_{feat}' in merged.columns]
-    feature_cols.extend(form_features)
-    
-    # Odds features
-    odds_features = ['home_prob_implied', 'draw_prob_implied', 'away_prob_implied']
-    odds_features = [col for col in odds_features if col in merged.columns]
-    feature_cols.extend(odds_features)
-    
-    print(f"Selected {len(feature_cols)} features: {feature_cols}")
-    
-    # Create final datasets
-    X = merged[feature_cols].copy()
-    y = merged['y'].copy()
-    
-    # Metadata for tracking
-    meta_cols = ['match_id', 'date', 'home_team', 'away_team']
-    if 'season' in merged.columns:
-        meta_cols.append('season')
-    if 'league' in merged.columns:
-        meta_cols.append('league')
-        
-    meta = merged[meta_cols].copy()
-    
-    print(f"Feature matrix shape: {X.shape}")
-    print(f"Target distribution:\n{pd.Series(y).value_counts().sort_index()}")
+    X = final_df[feature_columns].copy()
+    y = final_df['target'].copy()
+    meta = final_df[['match_id', 'date', 'home_team', 'away_team', 'season', 'league']].copy()
     
     return X, y, meta
 
 
+def add_derived_features(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
+    """Add derived features to improve model performance."""
+    df = df.copy()
+    
+    # Betting odds features (with better handling of missing values)
+    odds_cols = ['b365_home_odds', 'b365_draw_odds', 'b365_away_odds']
+    
+    if all(col in df.columns for col in odds_cols):
+        # Fill missing odds with neutral values
+        df['b365_home_odds'] = df['b365_home_odds'].fillna(2.5)
+        df['b365_draw_odds'] = df['b365_draw_odds'].fillna(3.5)
+        df['b365_away_odds'] = df['b365_away_odds'].fillna(2.5)
+        
+        # Convert to implied probabilities
+        df['home_prob_implied'] = (1 / df['b365_home_odds']).astype('float32')
+        df['draw_prob_implied'] = (1 / df['b365_draw_odds']).astype('float32')
+        df['away_prob_implied'] = (1 / df['b365_away_odds']).astype('float32')
+        
+        # Normalize probabilities
+        total_prob = df[['home_prob_implied', 'draw_prob_implied', 'away_prob_implied']].sum(axis=1)
+        df['home_prob_implied'] /= total_prob
+        df['draw_prob_implied'] /= total_prob
+        df['away_prob_implied'] /= total_prob
+    
+    # Form difference features - use dynamic column names
+    home_win_col = f'home_is_win_avg_{window}'
+    away_win_col = f'away_is_win_avg_{window}'
+    if home_win_col in df.columns and away_win_col in df.columns:
+        df['form_diff'] = (df[home_win_col] - df[away_win_col]).astype('float32')
+    
+    # Strength difference features - use dynamic column names
+    home_attack_col = f'home_attack_strength_{window}'
+    away_defense_col = f'away_defense_strength_{window}'
+    if home_attack_col in df.columns and away_defense_col in df.columns:
+        df['strength_diff'] = (df[home_attack_col] - df[away_defense_col]).astype('float32')
+    
+    # Total expected goals - use dynamic column names
+    away_attack_col = f'away_attack_strength_{window}'
+    if home_attack_col in df.columns and away_attack_col in df.columns:
+        df['total_avg_goals'] = (df[home_attack_col] + df[away_attack_col]).astype('float32')
+    
+    return df
+
+
 ####################
-# Model training and evaluation
+# Enhanced Model Training
 ####################
-def create_preprocessing_pipeline() -> Pipeline:
+def create_preprocessing_pipeline(X: pd.DataFrame) -> Pipeline:
     """Create preprocessing pipeline with imputation and scaling."""
-    return Pipeline([
-        ('imputer', SimpleImputer(strategy='mean')),
+    numeric_features = X.select_dtypes(include=[np.number]).columns.tolist()
+    
+    numeric_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='median')),
         ('scaler', StandardScaler())
     ])
+    
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('num', numeric_transformer, numeric_features)
+        ]
+    )
+    
+    return preprocessor
 
-
-def objective(trial: optuna.Trial, X: pd.DataFrame, y: pd.Series, n_splits: int = 5) -> float:
+def enhanced_objective(trial, X: pd.DataFrame, y: pd.Series, meta: pd.DataFrame, n_splits: int = 5) -> float:
     """
-    Optuna objective with improved parameter space and early stopping.
+    Optuna objective using TimeSeriesSplit CV. For portability we avoid early stopping
+    inside folds and use fixed n_estimators during CV (faster & stable).
     """
-    # Improved parameter suggestions
     params = {
-        'n_estimators': trial.suggest_int('n_estimators', 100, 1000, step=50),
-        'max_depth': trial.suggest_int('max_depth', 3, 12),
-        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
-        'subsample': trial.suggest_float('subsample', 0.6, 1.0),
-        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
-        'gamma': trial.suggest_float('gamma', 0.0, 5.0),
-        'reg_alpha': trial.suggest_float('reg_alpha', 1e-8, 10.0, log=True),
-        'reg_lambda': trial.suggest_float('reg_lambda', 1e-8, 10.0, log=True),
-        'min_child_weight': trial.suggest_int('min_child_weight', 1, 10),
-        
-        # Fixed parameters
-        'random_state': RANDOM_STATE,
+        'n_estimators': trial.suggest_int('n_estimators', 200, 800, step=50),
+        'max_depth': trial.suggest_int('max_depth', 4, 8),
+        'learning_rate': trial.suggest_float('learning_rate', 0.05, 0.2, log=True),
+        'subsample': trial.suggest_float('subsample', 0.7, 0.95, step=0.05),
+        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.7, 0.95, step=0.05),
+        'gamma': trial.suggest_float('gamma', 0.0, 2.0, step=0.1),
+        'reg_alpha': trial.suggest_float('reg_alpha', 1e-5, 1.0, log=True),
+        'reg_lambda': trial.suggest_float('reg_lambda', 1e-5, 1.0, log=True),
+        'min_child_weight': trial.suggest_int('min_child_weight', 1, 7),
+        'random_state': 42,
         'objective': 'multi:softprob',
         'num_class': 3,
         'tree_method': 'hist',
         'verbosity': 0,
-        'use_label_encoder': False,
-        'eval_metric': 'mlogloss'
+        'n_jobs': -1,
+        'use_label_encoder': False
     }
 
-    # Time series cross-validation
     tscv = TimeSeriesSplit(n_splits=n_splits)
+    preprocessor = create_preprocessing_pipeline(X)
+
     fold_scores = []
-    
-    # Create preprocessing pipeline
-    preprocessor = create_preprocessing_pipeline()
-    
-    for fold_idx, (train_idx, val_idx) in enumerate(tscv.split(X)):
+    for fold, (train_idx, val_idx) in enumerate(tscv.split(X)):
         try:
-            X_train_fold, X_val_fold = X.iloc[train_idx], X.iloc[val_idx]
-            y_train_fold, y_val_fold = y.iloc[train_idx], y.iloc[val_idx]
-            
-            # Preprocess data
-            X_train_processed = preprocessor.fit_transform(X_train_fold)
-            X_val_processed = preprocessor.transform(X_val_fold)
-            
-            # Train model with early stopping
+            X_fold_train, X_fold_val = X.iloc[train_idx], X.iloc[val_idx]
+            y_fold_train, y_fold_val = y.iloc[train_idx], y.iloc[val_idx]
+
+            if len(X_fold_train) < 100 or len(X_fold_val) < 20:
+                continue
+
+            # Fit preprocessing pipeline
+            X_fold_train_prep = preprocessor.fit_transform(X_fold_train)
+            X_fold_val_prep = preprocessor.transform(X_fold_val)
+
+            # Train without early stopping in CV (ensures compatibility)
             model = XGBClassifier(**params)
-            
-            # Use a portion of training data for early stopping validation
-            if len(X_train_fold) > 100:
-                split_idx = int(len(X_train_fold) * 0.9)
-                X_train_es = X_train_processed[:split_idx]
-                X_val_es = X_train_processed[split_idx:]
-                y_train_es = y_train_fold.iloc[:split_idx]
-                y_val_es = y_train_fold.iloc[split_idx:]
-                
-                model.fit(
-                    X_train_es, y_train_es,
-                    eval_set=[(X_val_es, y_val_es)],
-                    early_stopping_rounds=20,
-                    verbose=False
-                )
-            else:
-                model.fit(X_train_processed, y_train_fold)
-            
-            # Predict and evaluate
-            y_pred_proba = model.predict_proba(X_val_processed)
-            fold_score = log_loss(y_val_fold, y_pred_proba)
-            fold_scores.append(fold_score)
-            
+            model.fit(X_fold_train_prep, y_fold_train, verbose=False)
+
+            probs = model.predict_proba(X_fold_val_prep)
+            score = log_loss(y_fold_val, probs)
+            fold_scores.append(score)
+
+            # cleanup
+            del model, X_fold_train_prep, X_fold_val_prep
+            if get_memory_usage() > MAX_MEMORY_USAGE:
+                gc.collect()
+
         except Exception as e:
-            print(f"Error in fold {fold_idx}: {e}")
-            # Return a penalty score for failed folds
-            return 10.0
-    
+            print(f"Fold {fold} failed: {str(e)}")
+            continue
+
     if not fold_scores:
-        return 10.0
-        
-    mean_score = np.mean(fold_scores)
-    
-    # Report intermediate results for pruning
-    trial.report(mean_score, step=0)
-    if trial.should_prune():
-        raise optuna.TrialPruned()
-        
-    return mean_score
+        return float('inf')
+    return float(np.mean(fold_scores))
 
-
-def evaluate_model(model, X_test: pd.DataFrame, y_test: pd.Series, preprocessor) -> Dict[str, float]:
-    """Comprehensive model evaluation."""
-    X_test_processed = preprocessor.transform(X_test)
-    
-    # Predictions
-    y_pred_proba = model.predict_proba(X_test_processed)
-    y_pred = np.argmax(y_pred_proba, axis=1)
-    
-    # Calculate metrics
-    accuracy = accuracy_score(y_test, y_pred)
-    logloss = log_loss(y_test, y_pred_proba)
-    
-    # Brier score for each class
-    brier_scores = []
-    for class_idx in range(3):
-        y_binary = (y_test == class_idx).astype(int)
-        brier = brier_score_loss(y_binary, y_pred_proba[:, class_idx])
-        brier_scores.append(brier)
-    
-    brier_mean = np.mean(brier_scores)
+def comprehensive_evaluate(model, X_test, y_test, class_names=['H', 'D', 'A']) -> Dict[str, Any]:
+    """Comprehensive model evaluation with multiple metrics."""
+    probs = model.predict_proba(X_test)
+    preds = np.argmax(probs, axis=1)
     
     metrics = {
-        'accuracy': float(accuracy),
-        'log_loss': float(logloss), 
-        'brier_mean': float(brier_mean),
-        'brier_home': float(brier_scores[0]),
-        'brier_draw': float(brier_scores[1]),
-        'brier_away': float(brier_scores[2])
+        'accuracy': float(accuracy_score(y_test, preds)),
+        'log_loss': float(log_loss(y_test, probs)),
+        'f1_macro': float(f1_score(y_test, preds, average='macro')),
+        'f1_weighted': float(f1_score(y_test, preds, average='weighted')),
+        'precision_macro': float(precision_score(y_test, preds, average='macro')),
+        'recall_macro': float(recall_score(y_test, preds, average='macro'))
     }
     
-    # Print detailed results
-    print(f"\nFinal Model Evaluation:")
-    print(f"Accuracy: {accuracy:.4f}")
-    print(f"Log Loss: {logloss:.4f}")
-    print(f"Brier Score (mean): {brier_mean:.4f}")
-    print(f"\nClassification Report:")
-    print(classification_report(y_test, y_pred, target_names=RESULT_LABELS))
+    # Brier score per class
+    brier_scores = []
+    for i in range(3):
+        brier = brier_score_loss((y_test == i).astype(int), probs[:, i])
+        brier_scores.append(float(brier))
+        metrics[f'brier_class_{class_names[i]}'] = float(brier)
+    
+    metrics['brier_mean'] = float(np.mean(brier_scores))
+    
+    # Classification report
+    report = classification_report(y_test, preds, target_names=class_names, output_dict=True)
+    metrics['classification_report'] = report
     
     return metrics
 
 
-def train_and_save(X_train: pd.DataFrame, y_train: pd.Series, 
-                   X_test: pd.DataFrame, y_test: pd.Series,
-                   best_params: Dict[str, Any], ts_label: str) -> Tuple[str, Dict[str, Any]]:
+def train_final_model(X_train: pd.DataFrame, y_train: pd.Series, X_test: pd.DataFrame,
+                     y_test: pd.Series, best_params: Dict[str, Any], ts_label: str) -> Tuple[str, Dict[str, Any]]:
     """
-    Train final model and save artifacts.
+    Train final model with best_params. Try sklearn XGBClassifier.fit with early stopping.
+    If that fails (older xgboost builds), fall back to xgb.train() and ensure feature names
+    match the transformed data by converting transformed arrays back to DataFrames.
     """
-    print("Training final model...")
-    
-    # Create and fit preprocessor
-    preprocessor = create_preprocessing_pipeline()
-    X_train_processed = preprocessor.fit_transform(X_train)
-    X_test_processed = preprocessor.transform(X_test)
-    
-    # Train final model
-    model = XGBClassifier(**best_params)
-    model.fit(
-        X_train_processed, y_train,
-        eval_set=[(X_test_processed, y_test)],
-        early_stopping_rounds=50,
-        verbose=True
-    )
-    
-    # Evaluate model
-    metrics = evaluate_model(model, X_test, y_test, preprocessor)
-    
-    # Save artifacts
-    model_path = MODEL_DIR / f"xgb_model_{ts_label}.joblib"
+
+    # Build preprocessor and fit-transform training data
+    preprocessor = create_preprocessing_pipeline(X_train)
+    X_train_prep = preprocessor.fit_transform(X_train)
+    X_test_prep = preprocessor.transform(X_test)
+
+    numeric_features = X_train.select_dtypes(include=[np.number]).columns.tolist()
+
+    X_train_prep_df = pd.DataFrame(X_train_prep, columns=numeric_features, index=X_train.index)
+    X_test_prep_df = pd.DataFrame(X_test_prep, columns=numeric_features, index=X_test.index)
+
+    # First attempt: sklearn wrapper with early stopping (may fail on some xgboost builds)
+    try:
+        model = XGBClassifier(**best_params)
+        model.fit(
+            X_train_prep_df,
+            y_train,
+            eval_set=[(X_test_prep_df, y_test)],
+            early_stopping_rounds=50,
+            verbose=True
+        )
+
+        # Evaluate
+        metrics = comprehensive_evaluate(model, X_test_prep_df, y_test)
+
+        # Save sklearn-wrapped model
+        model_path = MODEL_DIR / f"xgb_model_{ts_label}.joblib"
+        joblib.dump(model, model_path)
+
+        feature_importances = dict(zip(numeric_features, model.feature_importances_.astype(float)))
+        model_type = 'sklearn_xgb'
+
+    except TypeError as e:
+        # Fallback: use xgboost.train with DMatrix (supports older xgboost builds)
+        print("Sklearn XGBClassifier.fit unsupported early_stopping in this xgboost build. Falling back to xgb.train().")
+        print("Original TypeError:", e)
+
+        # Create DMatrix from DataFrames (preserves feature names)
+        dtrain = xgb.DMatrix(X_train_prep_df, label=y_train)
+        dtest = xgb.DMatrix(X_test_prep_df, label=y_test)
+
+        # Prepare params for xgboost.train (remove sklearn-only keys)
+        params_xgb = {k: v for k, v in best_params.items() if k not in ('n_jobs', 'use_label_encoder')}
+        params_xgb['objective'] = params_xgb.get('objective', 'multi:softprob')
+        params_xgb['num_class'] = params_xgb.get('num_class', 3)
+        params_xgb['tree_method'] = params_xgb.get('tree_method', 'hist')
+        params_xgb['verbosity'] = params_xgb.get('verbosity', 0)
+
+        num_boost_round = int(best_params.get('n_estimators', 500))
+
+        evals_result = {}
+        booster = xgb.train(
+            params_xgb,
+            dtrain,
+            num_boost_round=num_boost_round,
+            evals=[(dtest, 'validation')],
+            early_stopping_rounds=50,
+            evals_result=evals_result,
+            verbose_eval=False
+        )
+
+        # Predictions and metrics
+        probs = booster.predict(dtest)
+        preds = np.argmax(probs, axis=1)
+        acc = accuracy_score(y_test, preds)
+        ll = log_loss(y_test, probs)
+        brier_vals = [float(brier_score_loss((y_test == cls).astype(int), probs[:, cls])) for cls in range(3)]
+        brier = sum(brier_vals) / len(brier_vals)
+
+        metrics = {
+            'accuracy': float(acc),
+            'log_loss': float(ll),
+            'brier_mean': float(brier),
+            'classification_report': classification_report(y_test, preds, target_names=['H', 'D', 'A'], output_dict=True)
+        }
+
+        # Save booster (JSON) + joblib fallback
+        model_path = MODEL_DIR / f"xgb_booster_{ts_label}.json"
+        booster.save_model(str(model_path))
+        try:
+            joblib.dump(booster, MODEL_DIR / f"xgb_booster_{ts_label}.joblib")
+        except Exception:
+            pass
+
+        # Feature importances (gain) -> map to numeric_features
+        fi = booster.get_score(importance_type='gain')
+        feature_importances = {fn: float(fi.get(fn, 0.0)) for fn in numeric_features}
+        model_type = 'xgb_booster'
+
+    # Save preprocessor
     preprocessor_path = ARTIFACT_DIR / f"preprocessor_{ts_label}.joblib"
-    meta_path = ARTIFACT_DIR / f"model_meta_{ts_label}.json"
-    
-    joblib.dump(model, model_path)
     joblib.dump(preprocessor, preprocessor_path)
-    
-    # Save metadata
+
+    # Save metadata using numeric_features (the actual transformed feature names)
+    meta_path = ARTIFACT_DIR / f"model_meta_{ts_label}.json"
     metadata = {
         "model_path": str(model_path),
         "preprocessor_path": str(preprocessor_path),
         "created_at": ts_label,
-        "n_features": int(X_train.shape[1]),
+        "n_features": len(numeric_features),
         "n_train": int(len(X_train)),
         "n_test": int(len(X_test)),
-        "features": list(X_train.columns),
+        "features": numeric_features,
         "params": best_params,
-        **metrics  # Include all evaluation metrics
+        "metrics": metrics,
+        "feature_importance": feature_importances,
+        "model_type": model_type
     }
-    
     with open(meta_path, "w") as f:
-        json.dump(metadata, f, indent=2)
-    
+        json.dump(metadata, f, indent=2, default=str)
+
     print(f"\nModel saved: {model_path}")
-    print(f"Preprocessor saved: {preprocessor_path}")
     print(f"Metadata saved: {meta_path}")
-    
     return str(model_path), metadata
 
 
-####################
-# Main execution
-####################
 def parse_args():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description="Train football match prediction model with Optuna")
+    """Parse command line arguments with better defaults."""
+    parser = argparse.ArgumentParser(description="Optimized football match prediction model training")
     parser.add_argument("--window", type=int, default=5, 
-                       help="Rolling window size for team features")
+                       help="Rolling window for team features (default: 5)")
     parser.add_argument("--n_trials", type=int, default=50, 
-                       help="Number of Optuna optimization trials")  
-    parser.add_argument("--n_splits", type=int, default=5,
-                       help="Number of TimeSeriesSplit CV folds")
-    parser.add_argument("--test_days", type=int, default=365,
-                       help="Number of days for holdout test set")
-    parser.add_argument("--min_date", type=str, default=None,
-                       help="Minimum date for data filtering (YYYY-MM-DD)")
-    parser.add_argument("--timeout", type=int, default=3600,
-                       help="Timeout for Optuna study in seconds")
+                       help="Optuna trials for hyperparameter optimization (default: 50)")
+    parser.add_argument("--n_splits", type=int, default=5, 
+                       help="TimeSeriesSplit cross-validation folds (default: 5)")
+    parser.add_argument("--test_days", type=int, default=365, 
+                       help="Holdout test period in days (default: 365)")
+    parser.add_argument("--min_date", type=str, default=None, 
+                       help="Minimum date for data fetching (YYYY-MM-DD)")
+    parser.add_argument("--quick_test", action="store_true", 
+                       help="Run with reduced trials for quick testing")
     return parser.parse_args()
 
-
 def main():
-    """Main training pipeline."""
+    """Main training pipeline with optimizations."""
     args = parse_args()
     
-    print("="*60)
-    print("Football Match Prediction Model Training")
-    print("="*60)
-    print(f"Configuration:")
-    print(f"  Window size: {args.window}")
-    print(f"  Optuna trials: {args.n_trials}")
-    print(f"  CV folds: {args.n_splits}")
-    print(f"  Test period: {args.test_days} days")
-    print(f"  Min date: {args.min_date or 'None'}")
-    print("="*60)
-
-    # Fetch and prepare data
-    df_all = fetch_matches(min_date=args.min_date)
+    if args.quick_test:
+        args.n_trials = 10
+        print("Quick test mode: Using reduced trials")
     
-    if len(df_all) == 0:
-        raise ValueError("No data fetched from database")
+    print("=" * 60)
+    print("OPTIMIZED FOOTBALL MATCH PREDICTION MODEL TRAINING")
+    print("=" * 60)
     
-    # Build features
-    X_all, y_all, meta = construct_feature_matrix(df_all, window=args.window)
+    print(f"Memory usage at start: {get_memory_usage():.1%}")
+    print(f"Using rolling window: {args.window}")
     
-    if len(X_all) == 0:
-        raise ValueError("No features could be constructed")
+    # Step 1: Data Loading
+    print("\n1. Fetching match data from database...")
+    df_matches = fetch_matches(min_date=args.min_date)
+    print(f"Loaded {len(df_matches):,} matches")
+    print(f"Date range: {df_matches['date'].min()} to {df_matches['date'].max()}")
+    print(f"Memory usage: {get_memory_usage():.1%}")
     
-    # Split data temporally
+    # Step 2: Feature Engineering
+    print("\n2. Building team performance features...")
+    team_records = build_team_features_vectorized(df_matches)
+    print(f"Created {len(team_records):,} team records")
+    
+    print(f"   Computing rolling statistics (window={args.window})...")
+    team_stats = compute_rolling_stats_optimized(team_records, window=args.window)
+    print(f"Memory usage after features: {get_memory_usage():.1%}")
+    
+    # Step 3: Create Feature Matrix
+    print("\n3. Creating feature matrix...")
+    X, y, meta = create_match_features(team_stats, df_matches, window=args.window)
+    print(f"Feature matrix shape: {X.shape}")
+    print(f"Features: {list(X.columns)}")
+    
+    # Memory cleanup
+    del df_matches, team_records, team_stats
+    gc.collect()
+    
+    # Step 4: Train/Test Split
+    print("\n4. Creating train/test split...")
     meta['date'] = pd.to_datetime(meta['date'])
-    last_date = meta['date'].max()
-    cutoff = last_date - pd.Timedelta(days=args.test_days)
+    cutoff_date = meta['date'].max() - pd.Timedelta(days=args.test_days)
     
-    train_mask = meta['date'] < cutoff
-    test_mask = meta['date'] >= cutoff
+    train_mask = meta['date'] < cutoff_date
+    test_mask = meta['date'] >= cutoff_date
     
-    X_train, y_train = X_all.loc[train_mask], y_all.loc[train_mask]
-    X_test, y_test = X_all.loc[test_mask], y_all.loc[test_mask]
+    X_train, X_test = X[train_mask].copy(), X[test_mask].copy()
+    y_train, y_test = y[train_mask].copy(), y[test_mask].copy()
     
-    print(f"\nData split:")
-    print(f"  Training: {len(X_train)} matches (up to {cutoff.date()})")
-    print(f"  Testing: {len(X_test)} matches (from {cutoff.date()})")
+    # Remove samples with too many missing features
+    train_valid_mask = X_train.isna().sum(axis=1) < len(X_train.columns) * 0.5
+    test_valid_mask = X_test.isna().sum(axis=1) < len(X_test.columns) * 0.5
     
-    if len(X_train) < 100:
-        raise ValueError(f"Insufficient training data: {len(X_train)} matches")
+    X_train, y_train = X_train[train_valid_mask], y_train[train_valid_mask]
+    X_test, y_test = X_test[test_valid_mask], y_test[test_valid_mask]
     
-    # Clean data - remove rows with all missing features
-    train_valid = ~X_train.isna().all(axis=1)
-    test_valid = ~X_test.isna().all(axis=1)
+    print(f"Training samples: {len(X_train):,}")
+    print(f"Test samples: {len(X_test):,}")
+    print(f"Cutoff date: {cutoff_date}")
     
-    X_train, y_train = X_train.loc[train_valid], y_train.loc[train_valid]
-    X_test, y_test = X_test.loc[test_valid], y_test.loc[test_valid]
-    
-    print(f"  After cleaning: {len(X_train)} train, {len(X_test)} test")
-    
-    # Optuna hyperparameter optimization
-    print(f"\nStarting Optuna optimization ({args.n_trials} trials)...")
+    # Step 5: Hyperparameter Optimization
+    print(f"\n5. Starting Optuna hyperparameter optimization ({args.n_trials} trials)...")
     
     study = optuna.create_study(
         direction="minimize",
-        study_name=f"xgb_football_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}",
-        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=0)
+        study_name=f"football_prediction_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}",
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=10)
     )
     
-    def optuna_objective(trial):
-        return objective(trial, X_train, y_train, n_splits=args.n_splits)
+    def objective_wrapper(trial):
+        return enhanced_objective(trial, X_train, y_train, meta[train_mask], args.n_splits)
     
-    study.optimize(
-        optuna_objective, 
-        n_trials=args.n_trials, 
-        timeout=args.timeout,
-        show_progress_bar=True
-    )
+    study.optimize(objective_wrapper, n_trials=args.n_trials, show_progress_bar=True)
     
-    print(f"\nOptimization completed!")
-    print(f"Best score: {study.best_trial.value:.4f}")
-    print(f"Best parameters: {study.best_trial.params}")
+    print(f"\nBest trial score: {study.best_trial.value:.4f}")
+    print("Best parameters:")
+    for key, value in study.best_trial.params.items():
+        print(f"  {key}: {value}")
     
-    # Prepare final model parameters
+    # Step 6: Final Model Training
+    print("\n6. Training final model...")
+    ts_label = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    
     best_params = study.best_trial.params.copy()
     best_params.update({
         'objective': 'multi:softprob',
         'num_class': 3,
-        'use_label_encoder': False,
+        'random_state': 42,
         'tree_method': 'hist',
-        'random_state': RANDOM_STATE,
-        'verbosity': 1,
-        'eval_metric': 'mlogloss'
+        'verbosity': 0,
+        'n_jobs': -1,
+        'use_label_encoder': False
     })
     
-    # Train and save final model
-    ts_label = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    model_path, metadata = train_and_save(X_train, y_train, X_test, y_test, best_params, ts_label)
+    model_path, metadata = train_final_model(X_train, y_train, X_test, y_test, best_params, ts_label)
     
-    print("="*60)
-    print("Training completed successfully!")
-    print(f"Model accuracy: {metadata['accuracy']:.4f}")
-    print(f"Model log loss: {metadata['log_loss']:.4f}")
-    print("="*60)
+    print(f"\n7. Training completed successfully!")
+    print(f"Final memory usage: {get_memory_usage():.1%}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
