@@ -144,7 +144,6 @@ def load_model_at_startup():
     return
 
 
-
 # ---- helpers to build features from DB or accept client-provided ----
 
 def fetch_recent_team_matches(team: str, cutoff_date: str, limit: int = 10):

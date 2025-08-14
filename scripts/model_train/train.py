@@ -442,6 +442,46 @@ def comprehensive_evaluate(model, X_test, y_test, class_names=['H', 'D', 'A']) -
     
     return metrics
 
+def register_model_in_db(metadata: dict, model_path: str, created_by: str = None, activate: bool = False) -> Optional[int]:
+    """
+    Insert a row into model_registry and optionally activate it.
+    Returns inserted model id.
+    Uses DATABASE_URL from env.
+    """
+    DATABASE_URL = os.getenv("DATABASE_URL")
+    if not DATABASE_URL:
+        print("DATABASE_URL not set; skipping DB model registration.")
+        return None
+
+    engine = create_engine(DATABASE_URL)
+    meta_json = json.dumps(metadata)
+
+    model_name = metadata.get("model_name") or f"xgb_model_{metadata.get('created_at', '')}"
+    version = metadata.get("created_at", str(int(pd.Timestamp.utcnow().timestamp())))
+
+    insert_sql = text("""
+        INSERT INTO model_registry (model_name, version, artifact_path, metadata, created_by, is_active)
+        VALUES (:model_name, :version, :artifact_path, :metadatab, :created_by, :is_active)
+        RETURNING id
+    """)
+
+    with engine.begin() as conn:
+        # if activate=true, deactivate others first
+        if activate:
+            conn.execute(text("UPDATE model_registry SET is_active = false WHERE is_active = true"))
+        res = conn.execute(insert_sql, {
+            "model_name": model_name,
+            "version": version,
+            "artifact_path": str(model_path),
+            "metadatab": meta_json,
+            "created_by": created_by,
+            "is_active": activate
+        })
+        row = res.fetchone()
+        model_id = int(row[0]) if row is not None else None
+
+    print(f"Registered model in DB id={model_id}, activate={activate}")
+    return model_id
 
 def train_final_model(X_train: pd.DataFrame, y_train: pd.Series, X_test: pd.DataFrame,
                      y_test: pd.Series, best_params: Dict[str, Any], ts_label: str) -> Tuple[str, Dict[str, Any]]:
@@ -561,10 +601,25 @@ def train_final_model(X_train: pd.DataFrame, y_train: pd.Series, X_test: pd.Data
     with open(meta_path, "w") as f:
         json.dump(metadata, f, indent=2, default=str)
 
+    # Add model_name to metadata (use ts_label or created_at)
+    metadata_for_db = metadata.copy()
+    metadata_for_db["model_name"] = f"xgb_model_{ts_label}"
+    metadata_for_db["artifact_filename"] = os.path.basename(model_path)
+
+    # Register the model in DB (do not auto-activate by default)
+    try:
+        model_db_id = register_model_in_db(metadata_for_db, model_path, created_by=os.getenv("USER") or os.getenv("USERNAME"), activate=True)
+        metadata['db_model_id'] = model_db_id
+        # update meta_path with db id if needed
+        with open(meta_path, "w") as f:
+            json.dump(metadata, f, indent=2, default=str)
+    except Exception as e:
+        print("Warning: failed to register model in DB:", e)
+
+
     print(f"\nModel saved: {model_path}")
     print(f"Metadata saved: {meta_path}")
     return str(model_path), metadata
-
 
 def parse_args():
     """Parse command line arguments with better defaults."""
