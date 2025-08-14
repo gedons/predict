@@ -445,52 +445,65 @@ def comprehensive_evaluate(model, X_test, y_test, class_names=['H', 'D', 'A']) -
     return metrics
 
 def _get_supabase_client():
-    """Get a Supabase client instance."""
     url = os.getenv("SUPABASE_URL")
     key = os.getenv("SUPABASE_KEY")
     if not url or not key:
-        print("Supabase URL or key not set; skipping Supabase client creation.")
         return None
-    return create_client(url, key)
+    try:
+        return create_client(url, key)
+    except Exception as e:
+        print("Warning: cannot create supabase client:", e)
+        return None
 
-def upload_file_to_supabase(local_path: str, bucket: str = None, object_name: str | None = None, public: bool = True) -> Optional[str]: # type: ignore
+def upload_file_to_supabase(local_path: str, bucket: Optional[str] = None, object_name: Optional[str] = None) -> Optional[str]:
     """
-    Upload local file to Supabase Storage bucket and return a public URL (or signed URL).
-    Returns None if upload failed or supabase env not configured.
+    Upload local file to Supabase Storage and return a public URL.
+    This is defensive across different supabase-py versions.
     """
     supabase = _get_supabase_client()
     if supabase is None:
         print("SUPABASE not configured; skipping upload.")
         return None
 
-    bucket = bucket or os.getenv("SUPABASE_BUCKET", "models")
     local_path = str(local_path)
+    bucket = bucket or os.getenv("SUPABASE_BUCKET", "models")
     object_name = object_name or Path(local_path).name
 
     try:
-        # Open file as bytes
-        with open(local_path, "rb") as f:
-            data = f.read()
+        # Try uploading by providing a file-like object (works on many client versions)
+        with open(local_path, "rb") as fh:
+            try:
+                res = supabase.storage.from_(bucket).upload(object_name, fh)  # most common signature
+            except TypeError:
+                # fallback: some versions expect raw bytes
+                fh.seek(0)
+                data = fh.read()
+                res = supabase.storage.from_(bucket).upload(object_name, data)
+            except Exception as e_inner:
+                # Last resort: some versions expect (path_on_bucket, file_path) or reversed args.
+                # Try calling with file path as second arg.
+                try:
+                    res = supabase.storage.from_(bucket).upload(object_name, local_path)
+                except Exception as e_last:
+                    raise RuntimeError(f"Supabase upload failed (multiple attempts): {e_inner} / {e_last}")
 
-        # Upload; upsert=True ensures overwrite existing with same name
-        res = supabase.storage.from_(bucket).upload(object_name, data, {"content-type": "application/octet-stream"}, upsert=True)
-
-        # supabase-py returns a dict; check error field
+        # Check for explicit error structure
         if isinstance(res, dict) and res.get("error"):
             raise RuntimeError(f"Supabase upload error: {res.get('error')}")
 
         # Get public URL
-        public_res = supabase.storage.from_(bucket).get_public_url(object_name)
-        # public_res may be dict or object depending on client version; try to extract URL robustly
-        if isinstance(public_res, dict):
-            public_url = public_res.get("publicURL") or public_res.get("public_url") or next(iter(public_res.values()), None)
-        else:
-            # sometimes returns string directly
-            public_url = getattr(public_res, "publicURL", None) or getattr(public_res, "public_url", None) or str(public_res)
-
-        if not public_url:
-            # fallback: construct URL manually if possible
+        try:
+            public_res = supabase.storage.from_(bucket).get_public_url(object_name)
+            if isinstance(public_res, dict):
+                public_url = public_res.get("publicURL") or public_res.get("public_url") or list(public_res.values())[0]
+            elif hasattr(public_res, "publicURL"):
+                public_url = getattr(public_res, "publicURL")
+            else:
+                public_url = str(public_res)
+        except Exception:
+            # Fallback: construct public url from known pattern
             supabase_url = os.getenv("SUPABASE_URL")
+            public_url = None
             if supabase_url:
                 public_url = f"{supabase_url}/storage/v1/object/public/{bucket}/{object_name}"
 
@@ -637,12 +650,10 @@ def train_final_model(X_train: pd.DataFrame, y_train: pd.Series, X_test: pd.Data
         fi = booster.get_score(importance_type='gain')
         feature_importances = {fn: float(fi.get(fn, 0.0)) for fn in numeric_features} # type: ignore
         model_type = 'xgb_booster'
-
-    # Save preprocessor
+    
     preprocessor_path = ARTIFACT_DIR / f"preprocessor_{ts_label}.joblib"
     joblib.dump(preprocessor, preprocessor_path)
 
-    # Save metadata using numeric_features (the actual transformed feature names)
     meta_path = ARTIFACT_DIR / f"model_meta_{ts_label}.json"
     metadata = {
         "model_path": str(model_path),
@@ -657,28 +668,54 @@ def train_final_model(X_train: pd.DataFrame, y_train: pd.Series, X_test: pd.Data
         "feature_importance": feature_importances,
         "model_type": model_type
     }
-    with open(meta_path, "w") as f:
-        json.dump(metadata, f, indent=2, default=str)
 
-    # Add model_name to metadata (use ts_label or created_at)
-    metadata_for_db = metadata.copy()
-    metadata_for_db["model_name"] = f"xgb_model_{ts_label}"
-    metadata_for_db["artifact_filename"] = os.path.basename(model_path)
-
-    # Register the model in DB (do not auto-activate by default)
+    # Try to upload to Supabase (best-effort)
     try:
-        model_db_id = register_model_in_db(metadata_for_db, model_path, created_by=os.getenv("USER") or os.getenv("USERNAME"), activate=True) # type: ignore
-        metadata['db_model_id'] = model_db_id
-        # update meta_path with db id if needed
+        supabase_model_url = upload_file_to_supabase(str(model_path), object_name=f"{Path(model_path).name}")
+        supabase_preproc_url = upload_file_to_supabase(str(preprocessor_path), object_name=f"{Path(preprocessor_path).name}")
+        if supabase_model_url:
+            metadata["artifact_url"] = supabase_model_url
+        if supabase_preproc_url:
+            metadata["preprocessor_url"] = supabase_preproc_url
+    except Exception as e:
+        print("Warning: exception during supabase upload:", e)
+
+    # write metadata file (always)
+    try:
         with open(meta_path, "w") as f:
             json.dump(metadata, f, indent=2, default=str)
     except Exception as e:
+        print("Warning: could not write model metadata file:", e)
+
+    # prepare DB registration
+    metadata_for_db = metadata.copy()
+    metadata_for_db["model_name"] = f"xgb_model_{ts_label}"
+    metadata_for_db["artifact_filename"] = os.path.basename(str(model_path))
+
+    artifact_path_for_db = metadata.get("artifact_url") or str(model_path)
+
+    model_db_id = None
+    try:
+        model_db_id = register_model_in_db(metadata_for_db, artifact_path_for_db, created_by=os.getenv("USER") or os.getenv("USERNAME"), activate=True) # type: ignore
+        metadata['db_model_id'] = model_db_id
+    except Exception as e:
         print("Warning: failed to register model in DB:", e)
 
-
+    # Final prints & guaranteed return
     print(f"\nModel saved: {model_path}")
     print(f"Metadata saved: {meta_path}")
-    return str(model_path), metadata
+    if model_db_id:
+        print(f"Registered model in DB id={model_db_id} (activate=True)")
+    else:
+        print("Model not registered in DB.")
+
+    # ensure we always return the model path and metadata tuple (string path, dict)
+    try:
+        return str(model_path), metadata
+    except Exception as e:
+        # if something odd happened, raise explicit error
+        raise RuntimeError(f"train_final_model failed to return results: {e}")
+
 
 def parse_args():
     """Parse command line arguments with better defaults."""
@@ -794,7 +831,10 @@ def main():
         'use_label_encoder': False
     })
     
-    model_path, metadata = train_final_model(X_train, y_train, X_test, y_test, best_params, ts_label)
+    result = train_final_model(X_train, y_train, X_test, y_test, best_params, ts_label)
+    if result is None:
+        raise RuntimeError("train_final_model returned None")
+    model_path, metadata = result
     
     print(f"\n7. Training completed successfully!")
     print(f"Final memory usage: {get_memory_usage():.1%}")
