@@ -25,6 +25,8 @@ import numpy as np
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 
+from supabase import create_client
+
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import (
     log_loss, accuracy_score, classification_report, 
@@ -108,7 +110,7 @@ def fetch_matches(min_date: Optional[str] = None) -> pd.DataFrame:
     """
     Fetch matches with optimized query and memory usage.
     """
-    engine = create_engine(DATABASE_URL, future=True)
+    engine = create_engine(DATABASE_URL, future=True) # type: ignore
     
     # More selective query to reduce memory usage
     base_query = """
@@ -350,7 +352,7 @@ def create_preprocessing_pipeline(X: pd.DataFrame) -> Pipeline:
         ]
     )
     
-    return preprocessor
+    return preprocessor # type: ignore
 
 def enhanced_objective(trial, X: pd.DataFrame, y: pd.Series, meta: pd.DataFrame, n_splits: int = 5) -> float:
     """
@@ -438,11 +440,68 @@ def comprehensive_evaluate(model, X_test, y_test, class_names=['H', 'D', 'A']) -
     
     # Classification report
     report = classification_report(y_test, preds, target_names=class_names, output_dict=True)
-    metrics['classification_report'] = report
+    metrics['classification_report'] = report  # type: ignore 
     
     return metrics
 
-def register_model_in_db(metadata: dict, model_path: str, created_by: str = None, activate: bool = False) -> Optional[int]:
+def _get_supabase_client():
+    """Get a Supabase client instance."""
+    url = os.getenv("SUPABASE_URL")
+    key = os.getenv("SUPABASE_KEY")
+    if not url or not key:
+        print("Supabase URL or key not set; skipping Supabase client creation.")
+        return None
+    return create_client(url, key)
+
+def upload_file_to_supabase(local_path: str, bucket: str = None, object_name: str | None = None, public: bool = True) -> Optional[str]: # type: ignore
+    """
+    Upload local file to Supabase Storage bucket and return a public URL (or signed URL).
+    Returns None if upload failed or supabase env not configured.
+    """
+    supabase = _get_supabase_client()
+    if supabase is None:
+        print("SUPABASE not configured; skipping upload.")
+        return None
+
+    bucket = bucket or os.getenv("SUPABASE_BUCKET", "models")
+    local_path = str(local_path)
+    object_name = object_name or Path(local_path).name
+
+    try:
+        # Open file as bytes
+        with open(local_path, "rb") as f:
+            data = f.read()
+
+        # Upload; upsert=True ensures overwrite existing with same name
+        res = supabase.storage.from_(bucket).upload(object_name, data, {"content-type": "application/octet-stream"}, upsert=True)
+
+        # supabase-py returns a dict; check error field
+        if isinstance(res, dict) and res.get("error"):
+            raise RuntimeError(f"Supabase upload error: {res.get('error')}")
+
+        # Get public URL
+        public_res = supabase.storage.from_(bucket).get_public_url(object_name)
+        # public_res may be dict or object depending on client version; try to extract URL robustly
+        if isinstance(public_res, dict):
+            public_url = public_res.get("publicURL") or public_res.get("public_url") or next(iter(public_res.values()), None)
+        else:
+            # sometimes returns string directly
+            public_url = getattr(public_res, "publicURL", None) or getattr(public_res, "public_url", None) or str(public_res)
+
+        if not public_url:
+            # fallback: construct URL manually if possible
+            supabase_url = os.getenv("SUPABASE_URL")
+            if supabase_url:
+                public_url = f"{supabase_url}/storage/v1/object/public/{bucket}/{object_name}"
+
+        print(f"Uploaded to Supabase: bucket={bucket}, object={object_name}, url={public_url}")
+        return public_url
+
+    except Exception as e:
+        print(f"Warning: supabase upload failed for {local_path}: {e}")
+        return None
+
+def register_model_in_db(metadata: dict, model_path: str, created_by: str = None, activate: bool = False) -> Optional[int]:  # type: ignore 
     """
     Insert a row into model_registry and optionally activate it.
     Returns inserted model id.
@@ -576,7 +635,7 @@ def train_final_model(X_train: pd.DataFrame, y_train: pd.Series, X_test: pd.Data
 
         # Feature importances (gain) -> map to numeric_features
         fi = booster.get_score(importance_type='gain')
-        feature_importances = {fn: float(fi.get(fn, 0.0)) for fn in numeric_features}
+        feature_importances = {fn: float(fi.get(fn, 0.0)) for fn in numeric_features} # type: ignore
         model_type = 'xgb_booster'
 
     # Save preprocessor
@@ -608,7 +667,7 @@ def train_final_model(X_train: pd.DataFrame, y_train: pd.Series, X_test: pd.Data
 
     # Register the model in DB (do not auto-activate by default)
     try:
-        model_db_id = register_model_in_db(metadata_for_db, model_path, created_by=os.getenv("USER") or os.getenv("USERNAME"), activate=True)
+        model_db_id = register_model_in_db(metadata_for_db, model_path, created_by=os.getenv("USER") or os.getenv("USERNAME"), activate=True) # type: ignore
         metadata['db_model_id'] = model_db_id
         # update meta_path with db id if needed
         with open(meta_path, "w") as f:

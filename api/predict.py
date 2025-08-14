@@ -1,8 +1,11 @@
 # app/api/predict.py
 import json
 import os
-from typing import Dict, Any
-from fastapi import APIRouter, HTTPException, Body
+import tempfile
+from typing import Dict, Any, Optional
+from urllib.parse import urlparse
+from fastapi import APIRouter, Depends, HTTPException, Body, Path, Request, requests
+from pathlib import Path
 from pydantic import BaseModel, Field
 import joblib
 import xgboost as xgb
@@ -10,6 +13,7 @@ import pandas as pd
 import numpy as np
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
+from app.db.database import get_db
 
 load_dotenv()
 
@@ -26,14 +30,14 @@ SKLEARN_MODEL = None
 router = APIRouter()
 
 class MatchRequest(BaseModel):
-    home_team: str = Field(..., example="Man United")
-    away_team: str = Field(..., example="Fulham")
-    match_date: str = Field(..., example="2025-08-16")  # YYYY-MM-DD
-    mode: str = Field("auto", description="auto | server | features", example="auto")
+    home_team: str = Field(..., example="Man United") # type: ignore
+    away_team: str = Field(..., example="Fulham") # type: ignore
+    match_date: str = Field(..., example="2025-08-16")  # type: ignore # YYYY-MM-DD
+    mode: str = Field("auto", description="auto | server | features", example="auto") # type: ignore
     # if mode == "features", supply feature dict below
-    features: Dict[str, float] = None
+    features: Dict[str, float] = None # type: ignore
 
-class PredictResponse(BaseModel):
+class PredictResponse(BaseModel):  # type: ignore
     match_id: str
     features: Dict[str, float]
     probabilities: Dict[str, float]
@@ -41,94 +45,163 @@ class PredictResponse(BaseModel):
     edge: Dict[str, float]
     model_meta: Dict[str, Any]
 
+def _download_to_tmp(url: str) -> str:   # type: ignore
+    """Download a http(s) URL to a temp file and return local path."""
+    resp = requests.get(url, stream=True, timeout=30) # type: ignore
+    resp.raise_for_status()
+    suffix = Path(urlparse(url).path).suffix or ".bin"
+    fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+    with os.fdopen(fd, "wb") as f:
+        for chunk in resp.iter_content(32 * 1024):
+            f.write(chunk)
+    return tmp_path
+
+def _resolve_artifact_path(artifact_path: str, meta_dir: str = None) -> str: # type: ignore
+    """
+    Resolve artifact path:
+      - If HTTP/S URL -> download and return local tmp file path
+      - If file:// URI -> strip scheme and return local path
+      - If relative path -> if meta_dir given, join meta_dir; else join project root
+      - If absolute path -> return as is
+    """
+    if not artifact_path:
+        raise RuntimeError("Empty artifact_path")
+    parsed = urlparse(artifact_path)
+    scheme = parsed.scheme.lower()
+    if scheme in ("http", "https"):
+        return _download_to_tmp(artifact_path)
+    if scheme == "file":
+        return parsed.path
+    # treat as local path (absolute or relative)
+    p = Path(artifact_path)
+    if p.is_absolute() and p.exists():
+        return str(p)
+    # if relative and meta_dir given, try meta_dir/artifact_path
+    if meta_dir:
+        candidate = Path(meta_dir) / artifact_path
+        if candidate.exists():
+            return str(candidate)
+    # else try project root relative
+    root_candidate = Path.cwd() / artifact_path
+    if root_candidate.exists():
+        return str(root_candidate)
+    # not found on disk
+    raise RuntimeError(f"Artifact not found or unsupported URI: {artifact_path}")
+
 def load_model_at_startup():
     """
-    Robust loader for model_meta + assets (preprocessor & model).
-    Tries multiple likely candidate paths (meta dir, meta_dir parent, cwd, cwd/app, etc.)
-    and prints helpful diagnostics if nothing is found.
+    Load the model at startup. Preference order:
+      1) MODEL_META_PATH environment variable pointing to explicit JSON (legacy)
+      2) DB model_registry active model (most recent is_active = true)
+      3) Local artifacts model_meta_*.json in app/artifacts or artifacts/
+    Supports HTTP(S) artifact URIs (will download temporarily).
     """
     global MODEL_META, PREPROCESSOR, BOOSTER, SKLEARN_MODEL, MODEL
 
+    # 1. explicit env override
     meta_path_env = os.getenv("MODEL_META_PATH")
-    if meta_path_env and os.path.exists(meta_path_env):
-        meta_path = os.path.normpath(meta_path_env)
+    if meta_path_env and Path(meta_path_env).exists():
+        meta_path = str(Path(meta_path_env))
+        meta_dir = str(Path(meta_path).parent)
+        with open(meta_path, "r") as f:
+            MODEL_META = json.load(f)
+        print(f"Loaded model_meta from explicit MODEL_META_PATH: {meta_path}")
+        # load preprocessor + model using resolving below
     else:
-        from glob import glob
-        candidates_meta = sorted(glob("app/artifacts/model_meta_*.json")) + sorted(glob("artifacts/model_meta_*.json"))
-        if not candidates_meta:
-            raise RuntimeError(
-                "No model_meta JSON found. Set MODEL_META_PATH in .env to the correct path "
-                "(e.g. app/artifacts/model_meta_<ts>.json) or place the JSON in app/artifacts/ or artifacts/."
-            )
-        meta_path = os.path.normpath(candidates_meta[-1])
+        # 2. check DB for active model (if DATABASE_URL present)
+        DATABASE_URL = os.getenv("DATABASE_URL")
+        meta_path = None
+        meta_dir = None
+        if DATABASE_URL:
+            try:
+                engine = create_engine(DATABASE_URL)
+                with engine.connect() as conn:
+                    row = conn.execute(text(
+                        "SELECT id, model_name, version, artifact_path, metadata FROM model_registry WHERE is_active = true ORDER BY created_at DESC LIMIT 1"
+                    )).fetchone()
+                if row:
+                    # artifact_path and metadata
+                    artifact_path = row["artifact_path"] if "artifact_path" in row.keys() else row[3] # type: ignore
+                    metadata = row["metadata"] if "metadata" in row.keys() else json.loads(row[4]) # type: ignore
+                    # normalize metadata (ensure dict)
+                    if isinstance(metadata, str):
+                        metadata = json.loads(metadata)
+                    MODEL_META = metadata
+                    # ensure MODEL_META contains useful fields
+                    MODEL_META.setdefault("created_at", metadata.get("created_at", metadata.get("version", "")))
+                    # store artifact path into MODEL_META to be consistent
+                    MODEL_META["artifact_path_source"] = artifact_path
+                    print(f"Found active model in DB: artifact_path={artifact_path}")
+                    # we will resolve artifact_path below
+                    meta_path = None
+                    meta_dir = None
+                else:
+                    print("No active model found in DB.")
+            except Exception as e:
+                print("Warning: failed to query DB for active model:", e)
 
-    meta_dir = os.path.dirname(meta_path)
-    meta_parent = os.path.normpath(os.path.join(meta_dir, ".."))
-    cwd = os.getcwd()
+        # 3. fallback to local JSONs if DB did not provide active model
+        if MODEL_META is None:
+            # try app/artifacts then artifacts/
+            candidates = sorted(Path("app/artifacts").glob("model_meta_*.json")) + sorted(Path("artifacts").glob("model_meta_*.json"))
+            if not candidates:
+                raise RuntimeError("No model metadata found (no MODEL_META_PATH, no active DB model, no local artifacts).")
+            meta_path = str(candidates[-1])
+            meta_dir = str(Path(meta_path).parent)
+            with open(meta_path, "r") as f:
+                MODEL_META = json.load(f)
+            print(f"Loaded local model_meta: {meta_path}")
 
-    with open(meta_path, "r") as f:
-        MODEL_META = json.load(f)
+    # At this point MODEL_META should be set.
+    if MODEL_META is None:
+        raise RuntimeError("MODEL_META is still None after resolution attempts.")
 
-    def resolve_asset_path(raw_path: str, meta_dir: str) -> str:
-        raw_norm = os.path.normpath(raw_path)
-        basename = os.path.basename(raw_norm)
+    # Resolve preprocessor path and model artifact path.
+    # Preprocessor path may be present in MODEL_META['preprocessor_path'] or we may use artifact metadata.
+    preproc_path_raw = MODEL_META.get("preprocessor_path")
+    # if DB supplied artifact_path use that as override
+    if MODEL_META.get("artifact_path_source"):
+        artifact_raw = MODEL_META["artifact_path_source"]
+    else:
+        artifact_raw = MODEL_META.get("model_path") or MODEL_META.get("artifact_path") or MODEL_META.get("artifact_filename")
 
-        candidates = []
+    resolved_preproc = None
+    resolved_model = None
 
-        # 1) Absolute raw path
-        if os.path.isabs(raw_norm):
-            candidates.append(raw_norm)
+    # resolve preprocessor
+    if preproc_path_raw:
+        try:
+            resolved_preproc = _resolve_artifact_path(preproc_path_raw, meta_dir=meta_dir) # type: ignore
+        except Exception as e:
+            print("Warning: failed to resolve preprocessor path:", e)
+            resolved_preproc = None
 
-        # 2) meta_dir / raw_path (common)
-        candidates.append(os.path.normpath(os.path.join(meta_dir, raw_norm)))
-        # 3) meta_dir / basename (if raw_path included "artifacts/" or "models/")
-        candidates.append(os.path.normpath(os.path.join(meta_dir, basename)))
+    # resolve model artifact
+    if artifact_raw:
+        try:
+            resolved_model = _resolve_artifact_path(artifact_raw, meta_dir=meta_dir) # type: ignore
+        except Exception as e:
+            # attempt a few fallbacks: if artifact_raw looks like a json metadata path, try to load from same dir
+            print("Warning: failed to resolve model artifact path:", e)
+            resolved_model = None
 
-        # 4) meta_dir parent (e.g., app/) + raw_path (covers app/models when meta in app/artifacts)
-        candidates.append(os.path.normpath(os.path.join(meta_parent, raw_norm)))
-        candidates.append(os.path.normpath(os.path.join(meta_parent, basename)))
+    # if preprocessor not found but the preprocessor file sits next to a local meta file, try meta_dir
+    if resolved_preproc is None and meta_dir:
+        # try to find preprocessor in meta_dir
+        for candidate in Path(meta_dir).glob("preprocessor_*.joblib"):
+            resolved_preproc = str(candidate)
+            break
 
-        # 5) cwd + raw_path (project-root relative)
-        candidates.append(os.path.normpath(os.path.join(cwd, raw_norm)))
-        candidates.append(os.path.normpath(os.path.join(cwd, basename)))
+    # final checks
+    if resolved_preproc is None:
+        print("Preprocessor not found/resolved; continuing without preprocessor (not recommended).")
+    else:
+        PREPROCESSOR = joblib.load(resolved_preproc)
 
-        # 6) cwd/app + raw_path and cwd/app + basename (cover cases where assets are under app/)
-        candidates.append(os.path.normpath(os.path.join(cwd, "app", raw_norm)))
-        candidates.append(os.path.normpath(os.path.join(cwd, "app", basename)))
+    if not resolved_model:
+        raise RuntimeError("Model artifact could not be resolved. Aborting model load.")
 
-        # 7) finally raw_norm as-is (relative)
-        candidates.append(raw_norm)
-
-        # dedupe preserving order
-        seen = set(); uniq = []
-        for p in candidates:
-            if p not in seen:
-                uniq.append(p); seen.add(p)
-
-        for p in uniq:
-            if os.path.exists(p):
-                return p
-
-        # Nothing found — raise diagnostic error
-        raise RuntimeError(
-            f"Could not resolve asset path for '{raw_path}'.\nTried the following locations:\n" +
-            "\n".join(f"  - {p}" for p in uniq) +
-            f"\n\nMeta file used: {meta_path}\nCurrent working dir: {cwd}"
-        )
-
-    # Resolve preprocessor
-    preproc_raw = MODEL_META.get("preprocessor_path")
-    if not preproc_raw:
-        raise RuntimeError("preprocessor_path not found in model_meta JSON")
-    resolved_preproc = resolve_asset_path(preproc_raw, meta_dir)
-    PREPROCESSOR = joblib.load(resolved_preproc)
-
-    # Resolve model
-    model_raw = MODEL_META.get("model_path")
-    if not model_raw:
-        raise RuntimeError("model_path not found in model_meta JSON")
-    resolved_model = resolve_asset_path(model_raw, meta_dir)
-
+    # load model based on declared type
     model_type = MODEL_META.get("model_type", "xgb_booster")
     if model_type == "sklearn_xgb":
         SKLEARN_MODEL = joblib.load(resolved_model)
@@ -140,15 +213,12 @@ def load_model_at_startup():
         MODEL = BOOSTER
         SKLEARN_MODEL = None
 
-    print(f"Loaded model: {resolved_model} (type={model_type})")
+    print(f"Loaded model artifact: {resolved_model} (type={model_type})")
     return
-
-
-# ---- helpers to build features from DB or accept client-provided ----
 
 def fetch_recent_team_matches(team: str, cutoff_date: str, limit: int = 10):
     """Fetch last N matches for team before cutoff_date from database (both home and away)."""
-    engine = create_engine(DATABASE_URL)
+    engine = create_engine(DATABASE_URL) # type: ignore
     # we need matches where either home_team or away_team equals team and date < cutoff_date
     sql = text("""
         SELECT date, home_team, away_team,
@@ -262,7 +332,7 @@ def build_feature_vector_from_db(home_team: str, away_team: str, match_date: str
 
     # Add implied odds: try to read latest odds from DB if exist between the two teams on the date,
     # otherwise leave NaN and user may supply them.
-    engine = create_engine(DATABASE_URL)
+    engine = create_engine(DATABASE_URL) # type: ignore # type: ignore
     sql = text("""
        SELECT b365_home_odds, b365_draw_odds, b365_away_odds
        FROM public.matches
@@ -295,34 +365,65 @@ def build_feature_vector_from_db(home_team: str, away_team: str, match_date: str
     feat["total_avg_goals"] = (feat.get("home_attack_strength_5") or 0) + (feat.get("away_attack_strength_5") or 0)
 
     # Reorder according to MODEL_META.features
-    order = MODEL_META["features"]
-    final = {k: float(feat.get(k)) if feat.get(k) is not None else np.nan for k in order}
+    order = MODEL_META["features"] # type: ignore
+    final = {k: float(feat.get(k)) if feat.get(k) is not None else np.nan for k in order} # type: ignore
     return final
 
-# ---- core predict helper ----
-
+def log_prediction(db_conn, resp: dict, model_id: Optional[int] = None, client_ip: Optional[str] = None, user_id: Optional[str] = None): # type: ignore
+    """
+    Insert a prediction log into prediction_logs table using an existing DB connection.
+    db_conn: a SQLAlchemy Connection or Session that supports execute()
+    resp: the response dict we return to the client
+    """
+    try:
+        insert_sql = text("""
+            INSERT INTO prediction_logs
+              (match_id, features, probabilities, implied_odds, edge, model_id, user_id, client_ip)
+            VALUES
+              (:match_id, :features, :probs, :implied, :edge, :model_id, :user_id, :client_ip)
+        """)
+        db_conn.execute(insert_sql, {
+            "match_id": resp.get("match_id"),
+            "features": json.dumps(resp.get("features", {})),
+            "probs": json.dumps(resp.get("probabilities", {})),
+            "implied": json.dumps(resp.get("implied_odds", {})),
+            "edge": json.dumps(resp.get("edge", {})),
+            "model_id": model_id,
+            "user_id": user_id,
+            "client_ip": client_ip
+        })
+        # commit if using Connection
+        try:
+            db_conn.commit()
+        except Exception:
+            # if db_conn is a raw Connection in SQLAlchemy, commit may be on the transaction context;
+            pass
+    except Exception as e:
+        # never block prediction on logging failure; log locally
+        print("Warning: failed to write prediction log:", e)
+        
 def predict_from_features_dict(features_dict: Dict[str, float]):
     """
     Accepts a dict with keys exactly equal to MODEL_META['features'] (or at least covering them).
     Returns probability vector and other metadata.
     """
     # Build DataFrame for single row
-    feature_names = MODEL_META["features"]
+    feature_names = MODEL_META["features"] # pyright: ignore[reportOptionalSubscript]
     X_df = pd.DataFrame([features_dict], columns=feature_names)
 
     # Preprocess (impute/scale) using PREPROCESSOR
-    X_prep = PREPROCESSOR.transform(X_df)  # numpy array
+    X_prep = PREPROCESSOR.transform(X_df)  # type: ignore 
 
-    if MODEL_META.get("model_type") == "sklearn_xgb":
+    if MODEL_META.get("model_type") == "sklearn_xgb":  # type: ignore 
         model = SKLEARN_MODEL
-        probs = model.predict_proba(X_prep)[0]
+        probs = model.predict_proba(X_prep)[0]  # type: ignore 
     else:
         # booster: use DMatrix created from DataFrame with proper column names
         dmat = xgb.DMatrix(pd.DataFrame(X_prep, columns=feature_names), feature_names=feature_names)
-        probs = BOOSTER.predict(dmat)[0]
+        probs = BOOSTER.predict(dmat)[0]  # type: ignore 
 
     # Build implied odds and edge (if implied present)
-    implied = {k: float(features_dict.get(k)) for k in ["home_prob_implied", "draw_prob_implied", "away_prob_implied"]}
+    implied = {k: float(features_dict.get(k)) for k in ["home_prob_implied", "draw_prob_implied", "away_prob_implied"]}  # type: ignore 
     # if implied are NaN, set None
     implied = { "home": implied.get("home_prob_implied") or None,
                 "draw": implied.get("draw_prob_implied") or None,
@@ -334,14 +435,15 @@ def predict_from_features_dict(features_dict: Dict[str, float]):
         if implied[k] is None or implied[k] != implied[k]:  # NaN check
             edge[k] = None
         else:
-            edge[k] = float(p[k] - implied[k])
+            edge[k] = float(p[k] - implied[k])  # type: ignore 
 
     return p, implied, edge
+
 
 # ---- endpoints ----
 
 @router.post("/match", response_model=PredictResponse)
-def predict_match(req: MatchRequest = Body(...)):
+def predict_match(req: MatchRequest = Body(...), request: Request = None, db = Depends(get_db)): # type: ignore
     """
     Predict endpoint.
     - mode=auto or server: API computes features from DB then predicts.
@@ -383,4 +485,35 @@ def predict_match(req: MatchRequest = Body(...)):
             "n_test": MODEL_META.get("n_test")
         }
     }
+
+        # try to find active model id in DB (optional)
+    model_id = None
+    try:
+        row = db.execute(text("SELECT id FROM model_registry WHERE is_active = true ORDER BY created_at DESC LIMIT 1")).fetchone()
+        if row:
+            # row may be tuple-like or mapping
+            try:
+                model_id = int(row['id'])
+            except Exception:
+                model_id = int(row[0])
+    except Exception as e:
+        # ignore DB read failure (we still want to return prediction)
+        print("Warning: cannot read active model from DB:", e)
+
+    # client IP
+    client_ip = None
+    try:
+        client_ip = request.client.host if request and request.client else None
+    except Exception:
+        client_ip = None
+
+    # optional: user_id if you have authentication. We'll leave None for now.
+    user_id = None
+
+    # Log prediction (best-effort)
+    try:
+        log_prediction(db, resp, model_id=model_id, client_ip=client_ip, user_id=user_id) # type: ignore
+    except Exception as e:
+        print("Warning: log_prediction raised:", e)
+
     return resp
