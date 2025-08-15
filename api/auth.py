@@ -33,16 +33,16 @@ def verify_password(plain_password: str, hashed_password: Optional[str]) -> bool
 
 
 def get_user_by_username_or_email(db, username_or_email: str):
-    """Get user row by email or username. Adjust SQL to fit your schema if different."""
-    with db.begin() as conn:
-        row = conn.execute(
-            text(
-                "SELECT id, email, username, password_hash, password, is_admin "
-                "FROM users WHERE email = :u OR username = :u LIMIT 1"
-            ),
-            {"u": username_or_email}
-        ).fetchone()
+    """Get user row by email or username. Works with SQLAlchemy ORM Session or raw SQL."""
+    row = db.execute(
+        text(
+            "SELECT id, email, username, password_hash, is_admin "
+            "FROM users WHERE email = :u OR username = :u LIMIT 1"
+        ),
+        {"u": username_or_email}
+    ).fetchone()
     return row
+
 
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
@@ -57,31 +57,43 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
 
 
 @router.post("/token")
-def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db = Depends(get_db)):
+def login_for_access_token(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db=Depends(get_db)
+):
     """
     Exchange username & password for JWT access token.
     - Form fields: username (or email), password
     """
     user_row = get_user_by_username_or_email(db, form_data.username)
     if not user_row:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect username or password")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password"
+        )
+
+    # Convert SQLAlchemy Row to a dict
+    user_dict = dict(user_row._mapping)
 
     # find hashed/password column
     stored_hash = None
     for k in ("password_hash", "password"):
-        if k in user_row.keys() and user_row[k]:
-            stored_hash = user_row[k]
+        if k in user_dict and user_dict[k]:
+            stored_hash = user_dict[k]
             break
 
-    if not verify_password(form_data.password, stored_hash):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect username or password")
+    if not stored_hash or not verify_password(form_data.password, stored_hash):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password"
+        )
 
-    user_id = user_row["id"]
-    email = user_row.get("email") or user_row.get("username")
+    user_id = user_dict["id"]
+    email = user_dict.get("email") or user_dict.get("username")
     payload = {
         "sub": str(user_id),
         "email": email,
-        "is_admin": bool(user_row.get("is_admin", False))
+        "is_admin": bool(user_dict.get("is_admin", False))
     }
     access_token = create_access_token(payload)
     return {"access_token": access_token, "token_type": "bearer"}
