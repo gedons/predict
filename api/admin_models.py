@@ -1,137 +1,183 @@
 # app/api/admin_models.py
 from fastapi import APIRouter, Depends, HTTPException, status
 from typing import List, Dict, Any, Optional
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 import os
 import json
+
 from app.core.auth import admin_required
 from app.db.database import get_db
 from app.core.reload_pubsub import publish_model_reload
 
 router = APIRouter(prefix="/admin/models", tags=["admin_models"])
 
-DATABASE_URL = os.getenv("DATABASE_URL")
 
-def _engine():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL not set")
-    return create_engine(DATABASE_URL)
+def _parse_metadata(raw_meta: Optional[Any]) -> Dict[str, Any]:
+    """Safely parse metadata stored as JSONB or string in the DB."""
+    if not raw_meta:
+        return {}
+    if isinstance(raw_meta, dict):
+        return raw_meta
+    if isinstance(raw_meta, str):
+        try:
+            return json.loads(raw_meta)
+        except Exception:
+            # fallback: return raw string under a key
+            return {"raw": raw_meta}
+    # other types -> convert to dict string
+    try:
+        return dict(raw_meta)
+    except Exception:
+        return {"raw": str(raw_meta)}
+
 
 @router.get("/", dependencies=[Depends(admin_required)])
-def list_models(limit: int = 100, offset: int = 0):
-    engine = _engine()
-    with engine.connect() as conn:
-        rows = conn.execute(text("SELECT id, model_name, version, artifact_path, metadata, created_by, created_at, is_active FROM model_registry ORDER BY created_at DESC LIMIT :limit OFFSET :offset"), {"limit": limit, "offset": offset}).fetchall()
-    result = []
+def list_models(limit: int = 100, offset: int = 0, db = Depends(get_db)):
+    """
+    List models in model_registry (paginated).
+    """
+    sql = text(
+        "SELECT id, model_name, version, artifact_path, metadata, created_by, created_at, is_active "
+        "FROM model_registry ORDER BY created_at DESC LIMIT :limit OFFSET :offset"
+    )
+    with db.connect() as conn:
+        rows = conn.execute(sql, {"limit": limit, "offset": offset}).fetchall()
+
+    models = []
     for r in rows:
-        meta = r["metadata"] if r["metadata"] is not None else {} # type: ignore
-        if isinstance(meta, str):
-            try:
-                meta = json.loads(meta)
-            except Exception:
-                meta = {}
-        result.append({
-            "id": r["id"], # type: ignore
-            "model_name": r["model_name"], # type: ignore
-            "version": r["version"], # type: ignore
-            "artifact_path": r["artifact_path"], # type: ignore
+        meta = _parse_metadata(r["metadata"])
+        models.append({
+            "id": r["id"],
+            "model_name": r["model_name"],
+            "version": r["version"],
+            "artifact_path": r["artifact_path"],
             "metadata": meta,
-            "created_by": r["created_by"], # type: ignore
-            "created_at": r["created_at"].isoformat() if r["created_at"] else None, # type: ignore
-            "is_active": bool(r["is_active"]) # type: ignore
+            "created_by": r["created_by"],
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            "is_active": bool(r["is_active"])
         })
-    return {"count": len(result), "models": result}
+
+    return {"count": len(models), "models": models}
+
 
 @router.get("/{model_id}", dependencies=[Depends(admin_required)])
-def get_model(model_id: int):
-    engine = _engine()
-    with engine.connect() as conn:
-        row = conn.execute(text("SELECT id, model_name, version, artifact_path, metadata, created_by, created_at, is_active FROM model_registry WHERE id = :id"), {"id": model_id}).fetchone()
+def get_model(model_id: int, db = Depends(get_db)):
+    sql = text(
+        "SELECT id, model_name, version, artifact_path, metadata, created_by, created_at, is_active "
+        "FROM model_registry WHERE id = :id"
+    )
+    with db.connect() as conn:
+        row = conn.execute(sql, {"id": model_id}).fetchone()
+
     if not row:
-        raise HTTPException(status_code=404, detail="Model not found")
-    meta = row["metadata"] or {} # type: ignore
-    if isinstance(meta, str):
-        try:
-            meta = json.loads(meta)
-        except:
-            meta = {}
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model not found")
+
+    meta = _parse_metadata(row["metadata"])
     return {
-        "id": row["id"], # type: ignore
-        "model_name": row["model_name"], # type: ignore
-        "version": row["version"], # type: ignore
-        "artifact_path": row["artifact_path"], # type: ignore
+        "id": row["id"],
+        "model_name": row["model_name"],
+        "version": row["version"],
+        "artifact_path": row["artifact_path"],
         "metadata": meta,
-        "created_by": row["created_by"], # type: ignore
-        "created_at": row["created_at"].isoformat() if row["created_at"] else None, # type: ignore
-        "is_active": bool(row["is_active"]) # type: ignore
+        "created_by": row["created_by"],
+        "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+        "is_active": bool(row["is_active"])
     }
 
+
 @router.post("/{model_id}/activate", dependencies=[Depends(admin_required)])
-def activate_model(model_id: int, reload: bool = True):
+def activate_model(model_id: int, reload: bool = True, current_user: Dict = Depends(admin_required), db = Depends(get_db)):
     """
     Activate this model (set is_active=true; others false).
-    If reload=True, call the running server's loader to load into memory.
+    If reload=True, attempt to load the model in this worker (via load_model_by_id)
+    and publish a reload event so other workers reload too.
     """
-    engine = _engine()
-    with engine.begin() as conn:
-        # deactivate others, activate this model
-        conn.execute(text("UPDATE model_registry SET is_active = false WHERE is_active = true"))
-        res = conn.execute(text("UPDATE model_registry SET is_active = true WHERE id = :id RETURNING id, artifact_path, metadata"), {"id": model_id})
-        row = res.fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="Model not found")
+    # Transaction: deactivate others, activate this
+    update_sql_deactivate = text("UPDATE model_registry SET is_active = false WHERE is_active = true")
+    update_sql_activate = text("UPDATE model_registry SET is_active = true WHERE id = :id RETURNING id, artifact_path, metadata, model_name, created_by, created_at")
+    try:
+        with db.begin() as conn:
+            conn.execute(update_sql_deactivate)
+            res = conn.execute(update_sql_activate, {"id": model_id})
+            row = res.fetchone()
+            # commit occurs on exiting the context
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"DB update failed: {e}")
 
-        artifact_path = row["artifact_path"] # type: ignore
-        metadata = row["metadata"] or {} # type: ignore
-        if isinstance(metadata, str):
-            try:
-                metadata = json.loads(metadata)
-            except:
-                metadata = {}
+    if not row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model not found")
 
-    # optionally reload into memory immediately
+    artifact_path = row["artifact_path"]
+    metadata = _parse_metadata(row["metadata"])
+
+    # Attempt local reload in this worker if requested
+    reload_result = {"reloaded_here": False, "error": None}
     if reload:
         try:
-            # call the loader that reads DB-active model
-            from app.api.predict import load_model_at_startup
-            load_model_at_startup()
+            # delayed import to avoid circular imports at module load time
+            from app.api.predict import load_model_by_id
+            load_model_by_id(model_id)
+            reload_result["reloaded_here"] = True
         except Exception as e:
-            # activation succeeded in DB but reload failed
-            return {"status": "activated_in_db", "reload": "failed", "error": str(e)}
-    
+            reload_result["error"] = str(e)
+
+    # Publish reload event for other workers (non-blocking)
     try:
         publish_model_reload(model_id)
-        print(f"Published model reload for model_id: {model_id}")
+        published = True
     except Exception as e:
-        print(f"Failed to publish model reload for model_id: {model_id}, error: {e}")
+        published = False
+        print(f"Warning: failed to publish model reload for model_id={model_id}: {e}")
 
-    return {"status": "activated", "model_id": model_id, "artifact_path": artifact_path, "metadata": metadata}
+    response = {
+        "status": "activated",
+        "model_id": model_id,
+        "artifact_path": artifact_path,
+        "metadata": metadata,
+        "activated_by": current_user.get("email"),
+        "reloaded_here": reload_result["reloaded_here"],
+        "reload_error": reload_result["error"],
+        "published_to_pubsub": published
+    }
+    return response
+
 
 @router.post("/{model_id}/deactivate", dependencies=[Depends(admin_required)])
-def deactivate_model(model_id: int):
-    engine = _engine()
-    with engine.begin() as conn:
-        res = conn.execute(text("UPDATE model_registry SET is_active = false WHERE id = :id RETURNING id"), {"id": model_id})
+def deactivate_model(model_id: int, current_user: Dict = Depends(admin_required), db = Depends(get_db)):
+    """
+    Deactivate a model in registry (set is_active=false).
+    """
+    sql = text("UPDATE model_registry SET is_active = false WHERE id = :id RETURNING id")
+    with db.begin() as conn:
+        res = conn.execute(sql, {"id": model_id})
         row = res.fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="Model not found")
-    return {"status": "deactivated", "model_id": model_id}
+    if not row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model not found")
+    return {"status": "deactivated", "model_id": model_id, "deactivated_by": current_user.get("email")}
+
 
 @router.post("/{model_id}/reload", dependencies=[Depends(admin_required)])
-def reload_model(model_id: int):
+def reload_model(model_id: int, db = Depends(get_db)):
     """
-    Force the running process to load the artifact for the given model id.
-    (Useful if you want to reload without changing DB active flag.)
+    Force the running worker to load the artifact for the given model id.
+    This does not change DB active flags.
     """
-    engine = _engine()
-    with engine.connect() as conn:
-        row = conn.execute(text("SELECT id, artifact_path, metadata FROM model_registry WHERE id = :id"), {"id": model_id}).fetchone()
+    # ensure model exists
+    with db.connect() as conn:
+        row = conn.execute(text("SELECT id FROM model_registry WHERE id = :id"), {"id": model_id}).fetchone()
     if not row:
-        raise HTTPException(status_code=404, detail="Model not found")
-    # If the artifact_path is stored as URL in DB metadata or artifact_path column, we still rely on load_model_at_startup() to handle download.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model not found")
+
     try:
-        from app.api.predict import load_model_at_startup
-        load_model_at_startup()
+        from app.api.predict import load_model_by_id
+        load_model_by_id(model_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Reload failed: {e}")
+
+    # also notify other workers
+    try:
+        publish_model_reload(model_id)
+    except Exception as e:
+        print(f"Warning: publish_model_reload failed after reload_model: {e}")
+
     return {"status": "reloaded", "model_id": model_id}
