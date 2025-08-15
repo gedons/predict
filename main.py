@@ -5,6 +5,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.predict import router as predict_router, load_model_at_startup
 from app.api.admin_models import router as admin_models_router
 from app.api.auth import router as auth_router
+from app.api.llm_analysis import router as llm_router
+
 
 from app.db.database import get_db
 
@@ -35,3 +37,4 @@ def startup_event():
 app.include_router(predict_router, prefix="/predict", tags=["predict"])
 app.include_router(admin_models_router)
 app.include_router(auth_router)
+app.include_router(llm_router)
