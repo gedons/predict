@@ -716,7 +716,6 @@ def train_final_model(X_train: pd.DataFrame, y_train: pd.Series, X_test: pd.Data
         # if something odd happened, raise explicit error
         raise RuntimeError(f"train_final_model failed to return results: {e}")
 
-
 def parse_args():
     """Parse command line arguments with better defaults."""
     parser = argparse.ArgumentParser(description="Optimized football match prediction model training")

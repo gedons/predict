@@ -4,7 +4,8 @@ import os
 import tempfile
 from typing import Dict, Any, Optional
 from urllib.parse import urlparse
-from fastapi import APIRouter, Depends, HTTPException, Body, Path, Request, requests
+from fastapi import APIRouter, Depends, HTTPException, Body, Path, Request
+import requests
 from pathlib import Path
 from pydantic import BaseModel, Field
 import joblib
@@ -18,7 +19,7 @@ from app.db.database import get_db
 load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-MODEL_META_PATH = os.getenv("MODEL_META_PATH", "artifacts/model_meta_latest.json")  
+MODEL_META_PATH = os.getenv("MODEL_META_PATH", "artifacts/20250814_141549.json")  
 
 # module-level globals populated at startup
 MODEL = None
@@ -45,15 +46,20 @@ class PredictResponse(BaseModel):  # type: ignore
     edge: Dict[str, float]
     model_meta: Dict[str, Any]
 
-def _download_to_tmp(url: str) -> str:   # type: ignore
-    """Download a http(s) URL to a temp file and return local path."""
-    resp = requests.get(url, stream=True, timeout=30) # type: ignore
+def _download_to_tmp(url: str) -> str:
+    """Download a http(s) URL to a temp file and return local path."""    
+    parsed = urlparse(url)
+    path_for_suffix = parsed.path
+    suffix = Path(path_for_suffix).suffix or ".bin"
+
+    resp = requests.get(url, stream=True, timeout=30)
     resp.raise_for_status()
-    suffix = Path(urlparse(url).path).suffix or ".bin"
+
     fd, tmp_path = tempfile.mkstemp(suffix=suffix)
     with os.fdopen(fd, "wb") as f:
         for chunk in resp.iter_content(32 * 1024):
-            f.write(chunk)
+            if chunk:
+                f.write(chunk)
     return tmp_path
 
 def _resolve_artifact_path(artifact_path: str, meta_dir: str = None) -> str: # type: ignore
@@ -90,28 +96,36 @@ def _resolve_artifact_path(artifact_path: str, meta_dir: str = None) -> str: # t
 
 def load_model_at_startup():
     """
-    Load the model at startup. Preference order:
-      1) MODEL_META_PATH environment variable pointing to explicit JSON (legacy)
-      2) DB model_registry active model (most recent is_active = true)
-      3) Local artifacts model_meta_*.json in app/artifacts or artifacts/
-    Supports HTTP(S) artifact URIs (will download temporarily).
+    Robust loader:
+      Priority:
+        1) Explicit MODEL_META_PATH if set (but prefer artifact_url / preprocessor_url inside it)
+        2) DB active model_registry row (artifact_path may be a URL)
+        3) Local artifacts/model_meta_*.json fallback
     """
     global MODEL_META, PREPROCESSOR, BOOSTER, SKLEARN_MODEL, MODEL
 
-    # 1. explicit env override
+    MODEL_META = None
+    meta_path = None
+    meta_dir = None
+
+    # 1) explicit file
     meta_path_env = os.getenv("MODEL_META_PATH")
-    if meta_path_env and Path(meta_path_env).exists():
-        meta_path = str(Path(meta_path_env))
-        meta_dir = str(Path(meta_path).parent)
-        with open(meta_path, "r") as f:
-            MODEL_META = json.load(f)
-        print(f"Loaded model_meta from explicit MODEL_META_PATH: {meta_path}")
-        # load preprocessor + model using resolving below
-    else:
-        # 2. check DB for active model (if DATABASE_URL present)
+    if meta_path_env:
+        try:
+            if Path(meta_path_env).exists():
+                with open(meta_path_env, "r", encoding="utf-8") as f:
+                    MODEL_META = json.load(f)
+                meta_path = str(Path(meta_path_env))
+                meta_dir = str(Path(meta_path_env).parent)
+                print(f"Loaded model_meta from explicit MODEL_META_PATH: {meta_path}")
+            else:
+                print(f"MODEL_META_PATH set but file not found: {meta_path_env}")
+        except Exception as e:
+            print(f"Warning: failed to read MODEL_META_PATH {meta_path_env}: {e}")
+
+    # 2) DB active model (enrich or fill MODEL_META)
+    if MODEL_META is None or not any(k in MODEL_META for k in ("artifact_url", "preprocessor_url", "model_path", "artifact_path", "artifact_filename")):
         DATABASE_URL = os.getenv("DATABASE_URL")
-        meta_path = None
-        meta_dir = None
         if DATABASE_URL:
             try:
                 engine = create_engine(DATABASE_URL)
@@ -120,101 +134,138 @@ def load_model_at_startup():
                         "SELECT id, model_name, version, artifact_path, metadata FROM model_registry WHERE is_active = true ORDER BY created_at DESC LIMIT 1"
                     )).fetchone()
                 if row:
-                    # artifact_path and metadata
-                    artifact_path = row["artifact_path"] if "artifact_path" in row.keys() else row[3] # type: ignore
-                    metadata = row["metadata"] if "metadata" in row.keys() else json.loads(row[4]) # type: ignore
-                    # normalize metadata (ensure dict)
-                    if isinstance(metadata, str):
-                        metadata = json.loads(metadata)
-                    MODEL_META = metadata
-                    # ensure MODEL_META contains useful fields
-                    MODEL_META.setdefault("created_at", metadata.get("created_at", metadata.get("version", "")))
-                    # store artifact path into MODEL_META to be consistent
-                    MODEL_META["artifact_path_source"] = artifact_path
-                    print(f"Found active model in DB: artifact_path={artifact_path}")
-                    # we will resolve artifact_path below
-                    meta_path = None
-                    meta_dir = None
-                else:
-                    print("No active model found in DB.")
+                    artifact_path_db = row["artifact_path"] if "artifact_path" in row.keys() else row[3] # type: ignore
+                    metadata_db = row["metadata"] if "metadata" in row.keys() else row[4] # type: ignore
+                    if isinstance(metadata_db, str):
+                        try:
+                            metadata_db = json.loads(metadata_db)
+                        except Exception:
+                            metadata_db = {}
+                    if MODEL_META is None:
+                        MODEL_META = metadata_db or {}
+                    else:
+                        for k, v in (metadata_db or {}).items():
+                            MODEL_META.setdefault(k, v)
+                    MODEL_META.setdefault("artifact_path_source", artifact_path_db)
+                    print(f"Found active model in DB: artifact_path={artifact_path_db}")
             except Exception as e:
-                print("Warning: failed to query DB for active model:", e)
+                print(f"Warning: failed to query DB for active model: {e}")
 
-        # 3. fallback to local JSONs if DB did not provide active model
-        if MODEL_META is None:
-            # try app/artifacts then artifacts/
-            candidates = sorted(Path("app/artifacts").glob("model_meta_*.json")) + sorted(Path("artifacts").glob("model_meta_*.json"))
-            if not candidates:
-                raise RuntimeError("No model metadata found (no MODEL_META_PATH, no active DB model, no local artifacts).")
+    # 3) local artifacts fallback
+    if MODEL_META is None:
+        candidates = sorted(Path("app/artifacts").glob("model_meta_*.json")) + sorted(Path("artifacts").glob("model_meta_*.json"))
+        if candidates:
             meta_path = str(candidates[-1])
             meta_dir = str(Path(meta_path).parent)
-            with open(meta_path, "r") as f:
+            with open(meta_path, "r", encoding="utf-8") as f:
                 MODEL_META = json.load(f)
             print(f"Loaded local model_meta: {meta_path}")
+        else:
+            raise RuntimeError("No model metadata available from MODEL_META_PATH, DB, or local artifacts.")
 
-    # At this point MODEL_META should be set.
-    if MODEL_META is None:
-        raise RuntimeError("MODEL_META is still None after resolution attempts.")
+    # Ensure dict
+    if not isinstance(MODEL_META, dict):
+        raise RuntimeError("MODEL_META content is not a JSON object.")
 
-    # Resolve preprocessor path and model artifact path.
-    # Preprocessor path may be present in MODEL_META['preprocessor_path'] or we may use artifact metadata.
-    preproc_path_raw = MODEL_META.get("preprocessor_path")
-    # if DB supplied artifact_path use that as override
-    if MODEL_META.get("artifact_path_source"):
-        artifact_raw = MODEL_META["artifact_path_source"]
-    else:
-        artifact_raw = MODEL_META.get("model_path") or MODEL_META.get("artifact_path") or MODEL_META.get("artifact_filename")
+    # Candidate extraction (prefer URLs)
+    preproc_url = MODEL_META.get("preprocessor_url") or MODEL_META.get("preprocessorURI") or MODEL_META.get("preprocessorPath")
+    preproc_path_raw = MODEL_META.get("preprocessor_path") or MODEL_META.get("preprocessorPath")
+
+    artifact_url = MODEL_META.get("artifact_url") or MODEL_META.get("artifactURL") or MODEL_META.get("artifactPath") or MODEL_META.get("artifact_path_source")
+    if not artifact_url:
+        artifact_url = MODEL_META.get("model_path") or MODEL_META.get("artifact_path") or MODEL_META.get("artifact_filename")
 
     resolved_preproc = None
     resolved_model = None
 
-    # resolve preprocessor
-    if preproc_path_raw:
+    # Try preprocessor_url then preprocessor_path
+    if preproc_url:
+        try:
+            resolved_preproc = _resolve_artifact_path(preproc_url, meta_dir=meta_dir) # type: ignore
+            print(f"Resolved preprocessor from URL: {preproc_url} -> {resolved_preproc}")
+        except Exception as e:
+            print(f"Warning: failed to resolve preprocessor_url {preproc_url}: {e}")
+
+    if resolved_preproc is None and preproc_path_raw:
         try:
             resolved_preproc = _resolve_artifact_path(preproc_path_raw, meta_dir=meta_dir) # type: ignore
+            print(f"Resolved preprocessor from path: {preproc_path_raw} -> {resolved_preproc}")
         except Exception as e:
-            print("Warning: failed to resolve preprocessor path:", e)
-            resolved_preproc = None
+            print(f"Warning: failed to resolve preprocessor path {preproc_path_raw}: {e}")
 
-    # resolve model artifact
-    if artifact_raw:
+    # Try artifact_url first
+    if artifact_url:
         try:
-            resolved_model = _resolve_artifact_path(artifact_raw, meta_dir=meta_dir) # type: ignore
+            resolved_model = _resolve_artifact_path(artifact_url, meta_dir=meta_dir) # type: ignore
+            print(f"Resolved model artifact from: {artifact_url} -> {resolved_model}")
         except Exception as e:
-            # attempt a few fallbacks: if artifact_raw looks like a json metadata path, try to load from same dir
-            print("Warning: failed to resolve model artifact path:", e)
+            print(f"Warning: failed to resolve artifact {artifact_url}: {e}")
             resolved_model = None
 
-    # if preprocessor not found but the preprocessor file sits next to a local meta file, try meta_dir
-    if resolved_preproc is None and meta_dir:
-        # try to find preprocessor in meta_dir
-        for candidate in Path(meta_dir).glob("preprocessor_*.joblib"):
-            resolved_preproc = str(candidate)
+    # If not resolved, search meta_dir but do NOT match model_meta_*.json
+    if resolved_model is None and meta_dir:
+        model_patterns = [
+            "xgb_booster_*.joblib", "xgb_booster_*.json",
+            "xgb_model_*.joblib", "xgb_model_*.json",
+            "model_*.joblib", "model_*.json"
+        ]
+        for patt in model_patterns:
+            for candidate in Path(meta_dir).glob(patt):
+                # Skip meta files (defensive) and ensure file actually exists
+                if "model_meta_" in candidate.name.lower():
+                    continue
+                if candidate.exists():
+                    resolved_model = str(candidate)
+                    print(f"Found model artifact next to meta: {resolved_model}")
+                    break
+            if resolved_model:
+                break
+
+    # Also try project-level models/ folder
+    if resolved_model is None:
+        for candidate in Path("models").glob("*.json"):
+            if "model_meta_" in candidate.name.lower():
+                continue
+            resolved_model = str(candidate)
+            print(f"Found model in models/: {resolved_model}")
             break
 
-    # final checks
-    if resolved_preproc is None:
-        print("Preprocessor not found/resolved; continuing without preprocessor (not recommended).")
+    # final preprocessor fallback: look next to meta (we did earlier)
+    if resolved_preproc is None and meta_dir:
+        for candidate in Path(meta_dir).glob("preprocessor_*.joblib"):
+            resolved_preproc = str(candidate)
+            print(f"Found preprocessor next to meta: {resolved_preproc}")
+            break
+
+    # load preprocessor if found
+    if resolved_preproc:
+        try:
+            PREPROCESSOR = joblib.load(resolved_preproc)
+            print(f"Loaded preprocessor from: {resolved_preproc}")
+        except Exception as e:
+            print(f"Warning: failed to load preprocessor {resolved_preproc}: {e}")
+            PREPROCESSOR = None
     else:
-        PREPROCESSOR = joblib.load(resolved_preproc)
+        print("Preprocessor not resolved/loaded - continuing without it (inference may require it).")
 
     if not resolved_model:
         raise RuntimeError("Model artifact could not be resolved. Aborting model load.")
 
-    # load model based on declared type
+    # finally load model
     model_type = MODEL_META.get("model_type", "xgb_booster")
-    if model_type == "sklearn_xgb":
-        SKLEARN_MODEL = joblib.load(resolved_model)
-        MODEL = SKLEARN_MODEL
-        BOOSTER = None
-    else:
-        BOOSTER = xgb.Booster()
-        BOOSTER.load_model(resolved_model)
-        MODEL = BOOSTER
-        SKLEARN_MODEL = None
-
-    print(f"Loaded model artifact: {resolved_model} (type={model_type})")
-    return
+    try:
+        if model_type == "sklearn_xgb" or str(resolved_model).endswith(".joblib"):
+            SKLEARN_MODEL = joblib.load(resolved_model)
+            MODEL = SKLEARN_MODEL
+            BOOSTER = None
+        else:
+            BOOSTER = xgb.Booster()
+            BOOSTER.load_model(resolved_model)
+            MODEL = BOOSTER
+            SKLEARN_MODEL = None
+        print(f"Loaded model artifact: {resolved_model} (type={model_type})")
+    except Exception as e:
+        raise RuntimeError(f"Failed to load model artifact {resolved_model}: {e}")
 
 def fetch_recent_team_matches(team: str, cutoff_date: str, limit: int = 10):
     """Fetch last N matches for team before cutoff_date from database (both home and away)."""
