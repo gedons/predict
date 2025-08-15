@@ -492,10 +492,7 @@ def predict_from_features_dict(features_dict: Dict[str, float]):
 
 def load_model_by_id(model_id: int):
     """
-    Load model by id from model_registry (DB). This will:
-      - query model_registry for the record,
-      - if artifact_path is a URL, download it (via _resolve_artifact_path),
-      - set MODEL_META and load PREPROCESSOR and MODEL into global state.
+    Load model by id from model_registry (DB).
     """
     global MODEL_META, PREPROCESSOR, BOOSTER, SKLEARN_MODEL, MODEL
 
@@ -505,26 +502,30 @@ def load_model_by_id(model_id: int):
 
     engine = create_engine(DATABASE_URL)
     with engine.connect() as conn:
-        row = conn.execute(text("SELECT id, model_name, artifact_path, metadata FROM model_registry WHERE id = :id"), {"id": model_id}).fetchone()
+        row = conn.execute(
+            text("""
+                SELECT id, model_name, artifact_path, metadata
+                FROM model_registry
+                WHERE id = :id
+            """),
+            {"id": model_id}
+        ).mappings().fetchone()
+
     if not row:
         raise RuntimeError(f"Model id {model_id} not found in registry")
 
-    # artifact_path could be URL or local path
-    artifact_path = row["artifact_path"] # type: ignore
-    metadata = row["metadata"] # type: ignore
+    artifact_path = row["artifact_path"]
+    metadata = row["metadata"]
     if isinstance(metadata, str):
         try:
             metadata = json.loads(metadata)
         except Exception:
             metadata = {}
 
-    # merge DB record into MODEL_META
     MODEL_META = metadata or {}
     MODEL_META["artifact_path_source"] = artifact_path
 
-    # attempt to resolve and load using existing resolver logic
-    # try preprocessor_url -> preprocessor_path -> meta_dir fallbacks
-    meta_dir = None  # not using local meta file here
+    meta_dir = None
     preproc_path_raw = MODEL_META.get("preprocessor_path") or MODEL_META.get("preprocessor_url")
     artifact_raw = MODEL_META.get("artifact_url") or MODEL_META.get("artifact_path_source") or MODEL_META.get("model_path")
 
@@ -543,7 +544,6 @@ def load_model_by_id(model_id: int):
         except Exception as e:
             print("load_model_by_id: failed to resolve model artifact:", e)
 
-    # try to find preprocessor if not resolved (no meta_dir here, try app/artifacts)
     if resolved_preproc is None:
         for candidate in Path("app/artifacts").glob("preprocessor_*.joblib"):
             resolved_preproc = str(candidate)
@@ -558,14 +558,16 @@ def load_model_by_id(model_id: int):
             PREPROCESSOR = None
 
     if not resolved_model:
-        # try a few conventional places
-        candidates = list(Path("app/models").glob("*")) + list(Path("models").glob("*")) + list(Path("app/artifacts").glob("xgb_booster_*.*"))
+        candidates = (
+            list(Path("app/models").glob("*")) +
+            list(Path("models").glob("*")) +
+            list(Path("app/artifacts").glob("xgb_booster_*.*"))
+        )
         for c in candidates:
             name = c.name.lower()
             if "model_meta_" in name:
                 continue
             if c.exists() and c.is_file():
-                # choose first matching json/joblib
                 if name.endswith(".json") or name.endswith(".joblib") or name.endswith(".bin"):
                     resolved_model = str(c)
                     break
@@ -573,7 +575,6 @@ def load_model_by_id(model_id: int):
     if not resolved_model:
         raise RuntimeError(f"Could not resolve model artifact for model_id {model_id} (artifact_path={artifact_path})")
 
-    # load model
     model_type = MODEL_META.get("model_type", "xgb_booster")
     try:
         if model_type == "sklearn_xgb" or str(resolved_model).endswith(".joblib"):

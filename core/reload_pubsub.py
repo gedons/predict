@@ -28,8 +28,7 @@ def _subscriber_loop():
             # use non-blocking get_message with short timeout to allow graceful stop
             message = pubsub.get_message(timeout=1.0)
             if not message:
-                continue
-            # message format: {'type': 'message', 'pattern': None, 'channel': 'model_reload', 'data': '{"model_id":1}'}
+                continue            
             if message.get("type") != "message":
                 continue
             data = message.get("data")
