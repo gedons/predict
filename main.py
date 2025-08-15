@@ -3,6 +3,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 from fastapi.middleware.cors import CORSMiddleware
 from app.api.predict import router as predict_router, load_model_at_startup
+from app.api.admin_models import router as admin_models_router
 
 from app.db.database import get_db
 
@@ -31,3 +32,4 @@ def startup_event():
     load_model_at_startup() 
 
 app.include_router(predict_router, prefix="/predict", tags=["predict"])
+app.include_router(admin_models_router)

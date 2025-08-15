@@ -696,7 +696,7 @@ def train_final_model(X_train: pd.DataFrame, y_train: pd.Series, X_test: pd.Data
 
     model_db_id = None
     try:
-        model_db_id = register_model_in_db(metadata_for_db, artifact_path_for_db, created_by=os.getenv("USER") or os.getenv("USERNAME"), activate=True) # type: ignore
+        model_db_id = register_model_in_db(metadata_for_db, artifact_path_for_db, created_by=os.getenv("USER") or os.getenv("USERNAME"), activate=False) # type: ignore
         metadata['db_model_id'] = model_db_id
     except Exception as e:
         print("Warning: failed to register model in DB:", e)
