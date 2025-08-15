@@ -6,6 +6,7 @@ import os
 import json
 from app.core.auth import admin_required
 from app.db.database import get_db
+from app.core.reload_pubsub import publish_model_reload
 
 router = APIRouter(prefix="/admin/models", tags=["admin_models"])
 
@@ -97,6 +98,12 @@ def activate_model(model_id: int, reload: bool = True):
         except Exception as e:
             # activation succeeded in DB but reload failed
             return {"status": "activated_in_db", "reload": "failed", "error": str(e)}
+    
+    try:
+        publish_model_reload(model_id)
+        print(f"Published model reload for model_id: {model_id}")
+    except Exception as e:
+        print(f"Failed to publish model reload for model_id: {model_id}, error: {e}")
 
     return {"status": "activated", "model_id": model_id, "artifact_path": artifact_path, "metadata": metadata}
 
