@@ -64,6 +64,13 @@ POST /predict/match
 - `GEMINI_MODEL`: Model name (default: `gemini-2.0-flash`)
 - `DATABASE_URL`: Database connection string (e.g., `postgresql://user:password@localhost/dbname`)
 - `MODEL_PATH`: Filesystem path to the trained model artifact (e.g., `app/artifacts/model.pkl`)
+- `SUPABASE_URL`: Supabase project URL
+- `SUPABASE_KEY`: Supabase service role key
+- `SUPABASE_BUCKET`: Supabase storage bucket for models
+- `JWT_SECRET`: Secret key for JWT token signing
+- `JWT_ALGORITHM`: Algorithm for JWT (default: `HS256`)
+- `ACCESS_TOKEN_EXPIRE_MINUTES`: JWT access token expiry (in minutes)
+- `REDIS_URL`: Redis connection URL
 
 ## Setup
 1. Install dependencies:
