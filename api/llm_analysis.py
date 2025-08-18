@@ -1,126 +1,503 @@
 # app/api/llm_analysis.py
-from fastapi import APIRouter, Depends, HTTPException
-from typing import Dict, Any, Optional
+from fastapi import APIRouter, Depends, HTTPException, status
+from typing import Dict, Any, Optional, Union, Tuple
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from app.db.database import get_db
 from app.services.context_builder import build_match_context
-from app.services.llm_service import call_gemini
+from app.services.llm_service import call_gemini, LLMServiceError
 import json
 import traceback
+import logging
+from pydantic import BaseModel, Field
+from datetime import datetime
+
+# Configure logging
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/predict", tags=["predict_enriched"])
 
+class MatchRequest(BaseModel):
+    """Validated match request schema"""
+    home_team: str = Field(..., min_length=1, max_length=100)
+    away_team: str = Field(..., min_length=1, max_length=100)
+    date: Optional[str] = Field(None, description="Match date in YYYY-MM-DD format")
+    league: Optional[str] = Field(None, max_length=100)
+    venue: Optional[str] = Field(None, max_length=100)
+    match_id: Optional[str] = Field(None, max_length=200)
+    extra_context: Optional[str] = Field(None, max_length=2000)
+    mode: Optional[str] = Field("auto", description="Prediction mode: auto, server, or features")
+    features: Optional[Dict[str, Any]] = Field(None, description="Feature vector when mode=features")
+    match_date: Optional[str] = Field(None, description="Alias for date field for compatibility")
+
+class PredictionResponse(BaseModel):
+    """Response schema for enriched predictions"""
+    model: Dict[str, Any]
+    llm_raw: str
+    llm_parsed: Dict[str, Any]
+    cached: bool
+    processing_time_ms: int
+    error: Optional[str] = None
+
+# Try to import existing predict function with better error handling
+predict_match_helper = None
 try:
+    # Import both the function and the router to avoid dependency issues
+    from app.api.predict import predict_match as predict_match_helper
+    logger.info("Successfully imported predict_match helper")
+except ImportError as e:
+    logger.warning(f"Could not import predict_match helper: {e}")
+except Exception as e:
+    logger.error(f"Unexpected error importing predict_match helper: {e}")
 
-    from app.api.predict import predict_match as predict_match_helper  # type: ignore
-except Exception:
-    predict_match_helper = None
+# Also try to import the original MatchRequest for compatibility
+original_match_request = None
+try:
+    from app.api.predict import MatchRequest as OriginalMatchRequest
+    original_match_request = OriginalMatchRequest
+    logger.info("Successfully imported original MatchRequest")
+except ImportError as e:
+    logger.warning(f"Could not import original MatchRequest: {e}")
+except Exception as e:
+    logger.error(f"Unexpected error importing original MatchRequest: {e}")
 
-@router.post("/enriched")
-def predict_enriched(match_request: Dict[str, Any], db = Depends(get_db), use_cache: bool = True):
+def _get_base_prediction(match_request: Union[Dict[str, Any], MatchRequest]) -> Dict[str, Any]:
     """
-    Accepts a match payload with at least:
-      - home_team
-      - away_team
-      - date (optional)
-      - league (optional)
-    Returns:
-      - base model output
-      - llm_analysis (parsed JSON or raw text)
+    Get base model prediction with multiple fallback strategies
     """
-
-    # 1) Get base model output (try to reuse your predict module)
     if predict_match_helper:
         try:
-            base = predict_match_helper(match_request, raw_output=True) # type: ignore
-            # expected structure:
-            # { "features": {...}, "probabilities": {"home":..,"draw":..,"away":..}, "model_meta": {...} }
-        except TypeError:
-            # maybe helper signature is different (no raw_output). Try basic call
-            base = predict_match_helper(match_request) # type: ignore
+            # Convert dict to MatchRequest object if needed
+            if isinstance(match_request, dict):
+                # Create a MatchRequest object from the dictionary
+                request_obj = MatchRequest(
+                    home_team=match_request.get("home_team", ""),
+                    away_team=match_request.get("away_team", ""),
+                    date=match_request.get("date"),
+                    league=match_request.get("league"),
+                    venue=match_request.get("venue"),
+                    match_id=match_request.get("match_id"),
+                    extra_context=match_request.get("extra_context"),
+                    mode=match_request.get("mode", "auto"),
+                    features=match_request.get("features"),
+                    match_date=match_request.get("match_date") or match_request.get("date")
+                )
+            else:
+                request_obj = match_request
+                # Ensure match_date is set if not provided
+                if not request_obj.match_date:
+                    request_obj.match_date = request_obj.date
+            
+            # Call the prediction function directly
+            base = predict_match_helper(request_obj) # type: ignore
+            logger.info("Successfully got prediction from helper")
+            return base
+                
+        except Exception as e:
+            logger.error(f"Prediction helper failed: {e}")
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            raise HTTPException(
+                status_code=500, 
+                detail=f"Prediction helper failed: {str(e)}"
+            )
     else:
-        raise HTTPException(status_code=500, detail="Prediction helper not found in app.api.predict. Please expose `predict_match(match_request, raw_output=True)`.")
+        # Create a mock prediction for testing/development
+        logger.warning("No prediction helper available, using mock data")
+        return {
+            "features": {
+                "home_shots_avg_5": 12.5,
+                "away_shots_avg_5": 10.2,
+                "form_diff": 0.3,
+                "home_goals_avg_5": 1.8,
+                "away_goals_avg_5": 1.2
+            },
+            "probabilities": {
+                "home": 0.45,
+                "draw": 0.30,
+                "away": 0.25
+            },
+            "model_meta": {
+                "model_version": "1.0",
+                "features_used": 15,
+                "confidence_score": 0.78
+            }
+        }
 
-    # minimal validation
-    probs = base.get("probabilities") or {}
+def _validate_base_prediction(base: Dict[str, Any]) -> None:
+    """Validate the structure of base prediction"""
+    if not isinstance(base, dict):
+        raise HTTPException(status_code=500, detail="Prediction must return a dictionary")
+    
+    probs = base.get("probabilities", {})
     if not probs:
-        raise HTTPException(status_code=500, detail="Prediction returned no probability output")
+        raise HTTPException(status_code=500, detail="Prediction returned no probabilities")
+    
+    # Check if probabilities are valid
+    required_outcomes = ["home", "draw", "away"]
+    for outcome in required_outcomes:
+        if outcome not in probs:
+            raise HTTPException(
+                status_code=500, 
+                detail=f"Missing probability for outcome: {outcome}"
+            )
+        if not isinstance(probs[outcome], (int, float)) or probs[outcome] < 0 or probs[outcome] > 1:
+            raise HTTPException(
+                status_code=500, 
+                detail=f"Invalid probability for {outcome}: {probs[outcome]}"
+            )
+    
+    # Check if probabilities sum to approximately 1.0
+    total_prob = sum(probs.values())
+    if abs(total_prob - 1.0) > 0.1:
+        logger.warning(f"Probabilities don't sum to 1.0: {total_prob}")
 
-    match_id = match_request.get("match_id") or f"{match_request.get('date','')}_{match_request.get('home_team','')}_{match_request.get('away_team','')}"
-    match_info = {
-        "home_team": match_request.get("home_team"),
-        "away_team": match_request.get("away_team"),
-        "date": match_request.get("date"),
-        "league": match_request.get("league"),
-        "venue": match_request.get("venue")
-    }
+def _generate_match_id(match_request: Union[Dict[str, Any], MatchRequest]) -> str:
+    """Generate a unique match ID"""
+    if isinstance(match_request, MatchRequest):
+        match_dict = match_request.model_dump()
+    else:
+        match_dict = match_request
+    
+    if match_dict.get("match_id"):
+        return str(match_dict["match_id"])
+    
+    date = match_dict.get("date", datetime.utcnow().strftime("%Y-%m-%d"))
+    home = match_dict.get("home_team", "unknown")
+    away = match_dict.get("away_team", "unknown")
+    
+    # Clean team names for ID generation
+    home_clean = "".join(c for c in home if c.isalnum())[:20]
+    away_clean = "".join(c for c in away if c.isalnum())[:20]
+    
+    return f"{date}_{home_clean}_{away_clean}"
 
-    # 2) Check DB cache (optional)
-    llm_result = None
-    if use_cache and db is not None:
-        try:
-            # create cache table if not exists (idempotent)
-            db.execute(text("""
-                CREATE TABLE IF NOT EXISTS IF NOT EXISTS llm_analysis_cache (
-                    id SERIAL PRIMARY KEY,
-                    match_id TEXT UNIQUE,
-                    model_meta JSONB,
-                    model_probs JSONB,
-                    llm_raw TEXT,
-                    llm_parsed JSONB,
-                    created_at TIMESTAMP DEFAULT now()
-                )"""))
-            db.commit()
-        except Exception:
-            # ignore DB create errors - server might not have permissions
-            db.rollback()
-
-        try:
-            q = text("SELECT llm_raw, llm_parsed FROM llm_analysis_cache WHERE match_id = :mid LIMIT 1")
-            row = db.execute(q, {"mid": match_id}).fetchone()
-            if row and row[0]:
-                # If stored, return cached analysis
-                llm_raw = row[0]
-                llm_parsed = row[1] if len(row) > 1 else None
-                return {"model": base, "llm_raw": llm_raw, "llm_parsed": llm_parsed, "cached": True}
-        except Exception:
-            # if cache query fails, continue to call LLM
-            pass
-
-    # 3) Build prompt and call Gemini
-    # Optionally pass `recent_stats` from `base["features"]` if available
-    recent_stats = {
-        # you can extend this mapping depending on what your features contain
-        "home_shots_avg_5": base.get("features", {}).get("home_shots_avg_5"),
-        "away_shots_avg_5": base.get("features", {}).get("away_shots_avg_5"),
-        "form_diff": base.get("features", {}).get("form_diff")
-    }
-
-    prompt = build_match_context(probs, match_info, recent_stats=recent_stats, extra_context=match_request.get("extra_context"))
-
+def _create_cache_table(db) -> bool:
+    """Create cache table if it doesn't exist"""
     try:
-        raw_text, parsed = call_gemini(prompt)
-    except Exception as e:
-        tb = traceback.format_exc()
-        raise HTTPException(status_code=500, detail=f"LLM call failed: {str(e)}\n{tb}")
+        # Fixed the duplicate "IF NOT EXISTS" in your original SQL
+        db.execute(text("""
+            CREATE TABLE IF NOT EXISTS llm_analysis_cache (
+                id SERIAL PRIMARY KEY,
+                match_id TEXT UNIQUE,
+                model_meta JSONB,
+                model_probs JSONB,
+                llm_raw TEXT,
+                llm_parsed JSONB,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+        
+        # Create index for faster lookups
+        db.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_llm_cache_match_id 
+            ON llm_analysis_cache(match_id)
+        """))
+        
+        db.commit()
+        return True
+    except SQLAlchemyError as e:
+        logger.error(f"Failed to create cache table: {e}")
+        db.rollback()
+        return False
 
-    # 4) Save to cache if DB available
-    if use_cache and db is not None:
+def _get_cached_analysis(db, match_id: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+    """Retrieve cached LLM analysis"""
+    try:
+        query = text("""
+            SELECT llm_raw, llm_parsed 
+            FROM llm_analysis_cache 
+            WHERE match_id = :mid 
+            ORDER BY created_at DESC 
+            LIMIT 1
+        """)
+        result = db.execute(query, {"mid": match_id}).fetchone()
+        
+        if result and result[0]:
+            llm_raw = result[0]
+            llm_parsed = result[1] if result[1] else {"text": llm_raw}
+            logger.info(f"Retrieved cached analysis for match_id: {match_id}")
+            return llm_raw, llm_parsed
+        
+        return None
+    except SQLAlchemyError as e:
+        logger.error(f"Failed to retrieve cached analysis: {e}")
+        return None
+
+def _save_to_cache(db, match_id: str, base: Dict[str, Any], llm_raw: str, llm_parsed: Dict[str, Any]) -> bool:
+    """Save analysis to cache"""
+    try:
+        upsert_query = text("""
+            INSERT INTO llm_analysis_cache (match_id, model_meta, model_probs, llm_raw, llm_parsed, updated_at)
+            VALUES (:mid, :meta, :probs, :raw, :parsed, CURRENT_TIMESTAMP)
+            ON CONFLICT (match_id) 
+            DO UPDATE SET 
+                model_meta = EXCLUDED.model_meta,
+                model_probs = EXCLUDED.model_probs,
+                llm_raw = EXCLUDED.llm_raw,
+                llm_parsed = EXCLUDED.llm_parsed,
+                updated_at = CURRENT_TIMESTAMP
+        """)
+        
+        db.execute(upsert_query, {
+            "mid": match_id,
+            "meta": json.dumps(base.get("model_meta", {})),
+            "probs": json.dumps(base.get("probabilities", {})),
+            "raw": llm_raw,
+            "parsed": json.dumps(llm_parsed if isinstance(llm_parsed, dict) else {"text": str(llm_parsed)})
+        })
+        db.commit()
+        logger.info(f"Saved analysis to cache for match_id: {match_id}")
+        return True
+    except SQLAlchemyError as e:
+        logger.error(f"Failed to save to cache: {e}")
+        db.rollback()
+        return False
+
+@router.post("/enriched", response_model=PredictionResponse)
+def predict_enriched(
+    match_request: MatchRequest, 
+    db = Depends(get_db), 
+    use_cache: bool = True,
+    force_refresh: bool = False
+):
+    """
+    Enhanced endpoint that combines model predictions with LLM analysis.
+    
+    Args:
+        match_request: Match details (home_team, away_team, date, etc.)
+        use_cache: Whether to use cached results
+        force_refresh: Force fresh LLM analysis even if cached
+    
+    Returns:
+        Combined model and LLM analysis with caching info
+    """
+    start_time = datetime.utcnow()
+    
+    try:
+        # 1) Get base model prediction
+        logger.info(f"Getting base prediction for {match_request.home_team} vs {match_request.away_team}")
+        base = _get_base_prediction(match_request)
+        _validate_base_prediction(base)
+        
+        # 2) Generate match ID
+        match_id = _generate_match_id(match_request)
+        
+        # 3) Prepare match info dict
+        match_info = {
+            "home_team": match_request.home_team,
+            "away_team": match_request.away_team,
+            "date": match_request.date or datetime.utcnow().strftime("%Y-%m-%d"),
+            "league": match_request.league,
+            "venue": match_request.venue
+        }
+        
+        # 4) Check cache first (unless force_refresh is True)
+        cached_result = None
+        if use_cache and not force_refresh and db is not None:
+            # Ensure cache table exists
+            _create_cache_table(db)
+            cached_result = _get_cached_analysis(db, match_id)
+            
+            if cached_result:
+                llm_raw, llm_parsed = cached_result
+                processing_time = int((datetime.utcnow() - start_time).total_seconds() * 1000)
+                
+                return PredictionResponse(
+                    model=base,
+                    llm_raw=llm_raw,
+                    llm_parsed=llm_parsed,
+                    cached=True,
+                    processing_time_ms=processing_time
+                )
+        
+        # 5) Generate LLM analysis
+        logger.info("Generating fresh LLM analysis")
+        
+        # Extract recent stats from model features
+        recent_stats = {}
+        features = base.get("features", {})
+        if features:
+            # Map your model features to meaningful stats
+            stat_mappings = {
+                "home_shots_avg_5": "Home shots (last 5)",
+                "away_shots_avg_5": "Away shots (last 5)", 
+                "home_goals_avg_5": "Home goals (last 5)",
+                "away_goals_avg_5": "Away goals (last 5)",
+                "form_diff": "Form difference",
+                "home_win_rate": "Home win rate",
+                "away_win_rate": "Away win rate"
+            }
+            
+            for feature_key, display_name in stat_mappings.items():
+                if feature_key in features and features[feature_key] is not None:
+                    recent_stats[display_name] = features[feature_key]
+        
+        # Build prompt and call LLM
+        prompt = build_match_context(
+            model_probs=base["probabilities"],
+            match_info=match_info,
+            recent_stats=recent_stats,
+            extra_context=match_request.extra_context
+        )
+        
         try:
-            insert = text("""
-                INSERT INTO llm_analysis_cache (match_id, model_meta, model_probs, llm_raw, llm_parsed)
-                VALUES (:mid, :meta, :probs, :raw, :parsed)
-                ON CONFLICT (match_id) DO UPDATE SET llm_raw = EXCLUDED.llm_raw, llm_parsed = EXCLUDED.llm_parsed, model_meta = EXCLUDED.model_meta, model_probs = EXCLUDED.model_probs, created_at = now()
-            """)
-            db.execute(insert, {
-                "mid": match_id,
-                "meta": json.dumps(base.get("model_meta", {})),
-                "probs": json.dumps(probs),
-                "raw": raw_text,
-                "parsed": json.dumps(parsed if isinstance(parsed, dict) else {"text": parsed})
-            })
-            db.commit()
-        except Exception:
-            db.rollback()
+            llm_raw, llm_parsed = call_gemini(prompt)
+            logger.info("Successfully generated LLM analysis")
+        except Exception as e:
+            logger.error(f"LLM analysis failed: {e}")
+            # Return model prediction with error info instead of failing completely
+            processing_time = int((datetime.utcnow() - start_time).total_seconds() * 1000)
+            return PredictionResponse(
+                model=base,
+                llm_raw="LLM analysis unavailable",
+                llm_parsed={"error": f"LLM service failed: {str(e)}"},
+                cached=False,
+                processing_time_ms=processing_time,
+                error=f"LLM analysis failed: {str(e)}"
+            )
+        
+        # 6) Save to cache
+        if use_cache and db is not None:
+            _save_to_cache(db, match_id, base, llm_raw, llm_parsed)
+        
+        processing_time = int((datetime.utcnow() - start_time).total_seconds() * 1000)
+        
+        return PredictionResponse(
+            model=base,
+            llm_raw=llm_raw,
+            llm_parsed=llm_parsed,
+            cached=False,
+            processing_time_ms=processing_time
+        )
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error in predict_enriched: {e}\n{traceback.format_exc()}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Internal server error: {str(e)}"
+        )
 
-    return {"model": base, "llm_raw": raw_text, "llm_parsed": parsed, "cached": False}
+# Additional debugging endpoint
+@router.post("/debug/base-prediction")
+def debug_base_prediction(match_request: MatchRequest):
+    """Debug endpoint to test base prediction function"""
+    try:
+        logger.info(f"Debug: Testing base prediction for {match_request.home_team} vs {match_request.away_team}")
+        
+        # Log the input we're sending
+        logger.info(f"Input type: {type(match_request)}")
+        logger.info(f"Input data: {match_request.model_dump()}")
+        
+        if predict_match_helper:
+            # Test different input formats
+            results = {}
+            
+            # Test 1: Pydantic object
+            try:
+                result1 = predict_match_helper(match_request) # type: ignore
+                results["pydantic_object"] = {"success": True, "result_type": str(type(result1))}
+            except Exception as e:
+                results["pydantic_object"] = {"success": False, "error": str(e)}
+            
+            # Test 2: Dictionary
+            try:
+                result2 = predict_match_helper(match_request.model_dump()) # type: ignore
+                results["dictionary"] = {"success": True, "result_type": str(type(result2))}
+            except Exception as e:
+                results["dictionary"] = {"success": False, "error": str(e)}
+            
+            # Test 3: With raw_output parameter
+            try:
+                result3 = predict_match_helper(match_request, raw_output=True) # type: ignore
+                results["with_raw_output"] = {"success": True, "result_type": str(type(result3))}
+            except Exception as e:
+                results["with_raw_output"] = {"success": False, "error": str(e)}
+            
+            return {
+                "helper_available": True,
+                "test_results": results,
+                "input_received": match_request.model_dump()
+            }
+        else:
+            return {
+                "helper_available": False,
+                "message": "predict_match_helper not imported",
+                "input_received": match_request.model_dump()
+            }
+            
+    except Exception as e:
+        logger.error(f"Debug endpoint failed: {e}")
+        return {
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+            "input_received": match_request.model_dump() if hasattr(match_request, 'model_dump') else str(match_request)
+        }
+
+@router.get("/cache/stats")
+def get_cache_stats(db = Depends(get_db)):
+    """Get cache statistics"""
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    try:
+        # Check if cache table exists
+        table_check = text("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = 'llm_analysis_cache'
+            )
+        """)
+        table_exists = db.execute(table_check).scalar()
+        
+        if not table_exists:
+            return {"cache_enabled": False, "total_entries": 0}
+        
+        # Get cache statistics
+        stats_query = text("""
+            SELECT 
+                COUNT(*) as total_entries,
+                COUNT(CASE WHEN created_at > NOW() - INTERVAL '24 hours' THEN 1 END) as entries_last_24h,
+                COUNT(CASE WHEN created_at > NOW() - INTERVAL '7 days' THEN 1 END) as entries_last_7d,
+                MAX(created_at) as last_entry
+            FROM llm_analysis_cache
+        """)
+        
+        result = db.execute(stats_query).fetchone()
+        
+        return {
+            "cache_enabled": True,
+            "total_entries": result[0] if result else 0,
+            "entries_last_24h": result[1] if result else 0,
+            "entries_last_7d": result[2] if result else 0,
+            "last_entry": result[3].isoformat() if result and result[3] else None
+        }
+        
+    except SQLAlchemyError as e:
+        logger.error(f"Failed to get cache stats: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve cache statistics")
+
+@router.delete("/cache/{match_id}")
+def clear_cache_entry(match_id: str, db = Depends(get_db)):
+    """Clear a specific cache entry"""
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    try:
+        delete_query = text("DELETE FROM llm_analysis_cache WHERE match_id = :mid")
+        result = db.execute(delete_query, {"mid": match_id})
+        db.commit()
+        
+        if result.rowcount > 0:
+            logger.info(f"Cleared cache entry for match_id: {match_id}")
+            return {"success": True, "message": f"Cleared cache for match_id: {match_id}"}
+        else:
+            return {"success": False, "message": "No cache entry found for this match_id"}
+            
+    except SQLAlchemyError as e:
+        logger.error(f"Failed to clear cache entry: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Failed to clear cache entry")

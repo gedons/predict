@@ -1,11 +1,13 @@
 # app/api/predict.py
 import json
+import math
 import os
 import tempfile
 from typing import Dict, Any, Optional
 from urllib.parse import urlparse
 from fastapi import APIRouter, Depends, HTTPException, Body, Path, Request
 import requests
+import traceback
 from pathlib import Path
 from pydantic import BaseModel, Field
 import joblib
@@ -19,7 +21,7 @@ from app.db.database import get_db
 load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-MODEL_META_PATH = os.getenv("MODEL_META_PATH", "artifacts/20250814_141549.json")  
+MODEL_META_PATH = os.getenv("MODEL_META_PATH", "artifacts/20250814_141549.json")
 
 # module-level globals populated at startup
 MODEL = None
@@ -30,24 +32,113 @@ SKLEARN_MODEL = None
 
 router = APIRouter()
 
+
 class MatchRequest(BaseModel):
     home_team: str = Field(..., example="Man United") # type: ignore
     away_team: str = Field(..., example="Fulham") # type: ignore
     match_date: str = Field(..., example="2025-08-16")  # type: ignore # YYYY-MM-DD
     mode: str = Field("auto", description="auto | server | features", example="auto") # type: ignore
     # if mode == "features", supply feature dict below
-    features: Dict[str, float] = None # type: ignore
+    features: Optional[Dict[str, Optional[float]]] = None
 
-class PredictResponse(BaseModel):  # type: ignore
+class PredictResponse(BaseModel):
     match_id: str
-    features: Dict[str, float]
+    # features may contain None for missing values
+    features: Dict[str, Optional[float]]
+    # probabilities are always floats produced by model
     probabilities: Dict[str, float]
-    implied_odds: Dict[str, float]
-    edge: Dict[str, float]
+    # implied odds may be missing -> Optional[float]
+    implied_odds: Dict[str, Optional[float]]
+    # edge may be computed or None when implied missing
+    edge: Dict[str, Optional[float]]
     model_meta: Dict[str, Any]
 
+
+def sanitize_for_json(obj):
+    """
+    Recursively convert values to JSON-safe Python types:
+      - numpy/pandas NaN/NA -> None
+      - numpy ints/floats -> int/float
+      - other problematic types -> str()
+    Returns a new object (doesn't mutate original).
+    """
+    # None
+    if obj is None:
+        return None
+
+    # numpy/pandas scalars & floats
+    if isinstance(obj, (np.floating, float)):
+        if math.isnan(float(obj)):
+            return None
+        return float(obj)
+    if isinstance(obj, (np.integer, int)):
+        return int(obj)
+    # Pandas NA / NA-like
+    try:
+        if pd.isna(obj):
+            return None
+    except Exception:
+        pass
+
+    # dict
+    if isinstance(obj, dict):
+        return {str(k): sanitize_for_json(v) for k, v in obj.items()}
+    # list/tuple/set
+    if isinstance(obj, (list, tuple, set)):
+        return [sanitize_for_json(v) for v in obj]
+
+    # bytes -> decode
+    if isinstance(obj, (bytes, bytearray)):
+        try:
+            return obj.decode("utf-8")
+        except Exception:
+            return str(obj)
+
+    # datetimes -> iso
+    try:
+        import datetime
+        if isinstance(obj, datetime.datetime):
+            return obj.isoformat()
+    except Exception:
+        pass
+
+    # booleans
+    if isinstance(obj, (np.bool_, bool)):
+        return bool(obj)
+
+    # other numpy numbers
+    try:
+        if isinstance(obj, np.number):
+            return float(obj)
+    except Exception:
+        pass
+
+    if isinstance(obj, (str, bool)):
+        return obj
+
+    # fallback
+    try:
+        return float(obj) if isinstance(obj, (int, float)) else obj
+    except Exception:
+        return str(obj)
+
+
+def safe_float(val, default=0.0):
+    """Return float(val) or default if NaN/None/uncoercible."""
+    try:
+        if val is None:
+            return float(default)
+        if isinstance(val, (np.floating, float)):
+            if math.isnan(float(val)):
+                return float(default)
+            return float(val)
+        return float(val)
+    except Exception:
+        return float(default)
+
+
 def _download_to_tmp(url: str) -> str:
-    """Download a http(s) URL to a temp file and return local path."""    
+    """Download a http(s) URL to a temp file and return local path."""
     parsed = urlparse(url)
     path_for_suffix = parsed.path
     suffix = Path(path_for_suffix).suffix or ".bin"
@@ -62,7 +153,8 @@ def _download_to_tmp(url: str) -> str:
                 f.write(chunk)
     return tmp_path
 
-def _resolve_artifact_path(artifact_path: str, meta_dir: str = None) -> str: # type: ignore
+
+def _resolve_artifact_path(artifact_path: str, meta_dir: str = None) -> str:  # type: ignore
     """
     Resolve artifact path:
       - If HTTP/S URL -> download and return local tmp file path
@@ -93,6 +185,7 @@ def _resolve_artifact_path(artifact_path: str, meta_dir: str = None) -> str: # t
         return str(root_candidate)
     # not found on disk
     raise RuntimeError(f"Artifact not found or unsupported URI: {artifact_path}")
+
 
 def load_model_at_startup():
     """
@@ -132,10 +225,10 @@ def load_model_at_startup():
                 with engine.connect() as conn:
                     row = conn.execute(text(
                         "SELECT id, model_name, version, artifact_path, metadata FROM model_registry WHERE is_active = true ORDER BY created_at DESC LIMIT 1"
-                    )).fetchone()
+                    )).mappings().fetchone()
                 if row:
-                    artifact_path_db = row["artifact_path"] if "artifact_path" in row.keys() else row[3] # type: ignore
-                    metadata_db = row["metadata"] if "metadata" in row.keys() else row[4] # type: ignore
+                    artifact_path_db = row.get("artifact_path") or row.get("artifact_path", None)
+                    metadata_db = row.get("metadata", None)
                     if isinstance(metadata_db, str):
                         try:
                             metadata_db = json.loads(metadata_db)
@@ -181,14 +274,14 @@ def load_model_at_startup():
     # Try preprocessor_url then preprocessor_path
     if preproc_url:
         try:
-            resolved_preproc = _resolve_artifact_path(preproc_url, meta_dir=meta_dir) # type: ignore
+            resolved_preproc = _resolve_artifact_path(preproc_url, meta_dir=meta_dir)  # type: ignore
             print(f"Resolved preprocessor from URL: {preproc_url} -> {resolved_preproc}")
         except Exception as e:
             print(f"Warning: failed to resolve preprocessor_url {preproc_url}: {e}")
 
     if resolved_preproc is None and preproc_path_raw:
         try:
-            resolved_preproc = _resolve_artifact_path(preproc_path_raw, meta_dir=meta_dir) # type: ignore
+            resolved_preproc = _resolve_artifact_path(preproc_path_raw, meta_dir=meta_dir)  # type: ignore
             print(f"Resolved preprocessor from path: {preproc_path_raw} -> {resolved_preproc}")
         except Exception as e:
             print(f"Warning: failed to resolve preprocessor path {preproc_path_raw}: {e}")
@@ -196,7 +289,7 @@ def load_model_at_startup():
     # Try artifact_url first
     if artifact_url:
         try:
-            resolved_model = _resolve_artifact_path(artifact_url, meta_dir=meta_dir) # type: ignore
+            resolved_model = _resolve_artifact_path(artifact_url, meta_dir=meta_dir)  # type: ignore
             print(f"Resolved model artifact from: {artifact_url} -> {resolved_model}")
         except Exception as e:
             print(f"Warning: failed to resolve artifact {artifact_url}: {e}")
@@ -211,7 +304,6 @@ def load_model_at_startup():
         ]
         for patt in model_patterns:
             for candidate in Path(meta_dir).glob(patt):
-                # Skip meta files (defensive) and ensure file actually exists
                 if "model_meta_" in candidate.name.lower():
                     continue
                 if candidate.exists():
@@ -267,232 +359,14 @@ def load_model_at_startup():
     except Exception as e:
         raise RuntimeError(f"Failed to load model artifact {resolved_model}: {e}")
 
-def fetch_recent_team_matches(team: str, cutoff_date: str, limit: int = 10):
-    """Fetch last N matches for team before cutoff_date from database (both home and away)."""
-    engine = create_engine(DATABASE_URL) # type: ignore
-    # we need matches where either home_team or away_team equals team and date < cutoff_date
-    sql = text("""
-        SELECT date, home_team, away_team,
-               full_time_home_goals, full_time_away_goals,
-               home_shots, away_shots, home_shots_on_target, away_shots_on_target,
-               home_corners, away_corners, full_time_result
-        FROM public.matches
-        WHERE date < :cutoff
-          AND (home_team = :team OR away_team = :team)
-        ORDER BY date DESC
-        LIMIT :limit
-    """)
-    with engine.connect() as conn:
-        df = pd.read_sql(sql, conn, params={"cutoff": cutoff_date, "team": team, "limit": limit})
-    return df
-
-def compute_rolling_features_for_team(team_df: pd.DataFrame, team_name: str, window: int = 5, is_home_perspective=True):
-    """Compute aggregates used in training for a single team from its past matches (team_df expected sorted desc)."""
-    if team_df is None or team_df.empty:
-        # produce NaNs for all features
-        return {
-            "is_win_avg": np.nan,
-            "is_win_form_3": np.nan,
-            "goal_diff_avg": np.nan,
-            "shots_avg": np.nan,
-            "shots_on_target_avg": np.nan,
-            "corners_avg": np.nan,
-            "attack_strength": np.nan,
-            "defense_strength": np.nan
-        }
-    # convert dates & compute perspective-specific columns
-    df = team_df.copy()
-    # We need to interpret goals/shots/corners from the perspective of `team_name`
-    def get_for(row):
-        if row["home_team"] == team_name:
-            gf = row["full_time_home_goals"]
-            ga = row["full_time_away_goals"]
-            shots = row.get("home_shots")
-            sots = row.get("home_shots_on_target")
-            corners = row.get("home_corners")
-            result = row["full_time_result"]
-            # result codes: H home win, A away win, D draw
-            is_win = 1 if result == "H" else 0
-        else:
-            gf = row["full_time_away_goals"]
-            ga = row["full_time_home_goals"]
-            shots = row.get("away_shots")
-            sots = row.get("away_shots_on_target")
-            corners = row.get("away_corners")
-            result = row["full_time_result"]
-            is_win = 1 if result == "A" else 0
-        return pd.Series({
-            "gf": gf, "ga": ga, "goal_diff": gf - ga,
-            "shots": shots if pd.notnull(shots) else np.nan,
-            "sots": sots if pd.notnull(sots) else np.nan,
-            "corners": corners if pd.notnull(corners) else np.nan,
-            "is_win": is_win
-        })
-
-    stats = df.apply(get_for, axis=1)
-    # use last `window` matches (already ordered desc)
-    lastk = stats.head(window)
-    res = {}
-    res["is_win_avg"] = float(lastk["is_win"].mean()) if not lastk.empty else np.nan
-    # form over last 3
-    res["is_win_form_3"] = float(lastk["is_win"].head(3).mean()) if not lastk.empty else np.nan
-    res["goal_diff_avg"] = float(lastk["goal_diff"].mean()) if not lastk.empty else np.nan
-    res["shots_avg"] = float(lastk["shots"].mean()) if not lastk.empty else np.nan
-    res["shots_on_target_avg"] = float(lastk["sots"].mean()) if not lastk.empty else np.nan
-    res["corners_avg"] = float(lastk["corners"].mean()) if not lastk.empty else np.nan
-    # attack/defense strength approximated by gf avg and ga avg
-    res["attack_strength"] = float(lastk["gf"].mean()) if "gf" in lastk.columns and not lastk.empty else np.nan
-    res["defense_strength"] = float(lastk["ga"].mean()) if "ga" in lastk.columns and not lastk.empty else np.nan
-    return res
-
-def build_feature_vector_from_db(home_team: str, away_team: str, match_date: str, window: int = 5):
-    """Compute the final feature dict exactly matching MODEL_META['features'] order."""
-    # query last N matches per team
-    home_hist = fetch_recent_team_matches(home_team, cutoff_date=match_date, limit=20)  # get enough history
-    away_hist = fetch_recent_team_matches(away_team, cutoff_date=match_date, limit=20)
-
-    # they are ordered DESC; compute using that
-    home_feats = compute_rolling_features_for_team(home_hist, home_team, window=window)
-    away_feats = compute_rolling_features_for_team(away_hist, away_team, window=window)
-
-    feat = {
-        # raw last-match numbers (we also keep current aggregated names)
-        "home_shots": home_feats.get("shots_avg"),
-        "away_shots": away_feats.get("shots_avg"),
-        "home_shots_on_target": home_feats.get("shots_on_target_avg"),
-        "away_shots_on_target": away_feats.get("shots_on_target_avg"),
-        "home_corners": home_feats.get("corners_avg"),
-        "away_corners": away_feats.get("corners_avg"),
-        "home_is_win_avg_5": home_feats.get("is_win_avg"),
-        "home_is_win_form_3": home_feats.get("is_win_form_3"),
-        "home_goal_diff_avg_5": home_feats.get("goal_diff_avg"),
-        "home_shots_avg_5": home_feats.get("shots_avg"),
-        "home_shots_on_target_avg_5": home_feats.get("shots_on_target_avg"),
-        "home_corners_avg_5": home_feats.get("corners_avg"),
-        "home_attack_strength_5": home_feats.get("attack_strength"),
-        "home_defense_strength_5": home_feats.get("defense_strength"),
-        "away_is_win_avg_5": away_feats.get("is_win_avg"),
-        "away_is_win_form_3": away_feats.get("is_win_form_3"),
-        "away_goal_diff_avg_5": away_feats.get("goal_diff_avg"),
-        "away_shots_avg_5": away_feats.get("shots_avg"),
-        "away_shots_on_target_avg_5": away_feats.get("shots_on_target_avg"),
-        "away_corners_avg_5": away_feats.get("corners_avg"),
-        "away_attack_strength_5": away_feats.get("attack_strength"),
-        "away_defense_strength_5": away_feats.get("defense_strength"),
-    }
-
-    # Add implied odds: try to read latest odds from DB if exist between the two teams on the date,
-    # otherwise leave NaN and user may supply them.
-    engine = create_engine(DATABASE_URL) # type: ignore # type: ignore
-    sql = text("""
-       SELECT b365_home_odds, b365_draw_odds, b365_away_odds
-       FROM public.matches
-       WHERE date < :date
-         AND ((home_team = :home AND away_team = :away) OR (home_team = :away AND away_team = :home))
-       ORDER BY date DESC
-       LIMIT 1
-    """)
-    with engine.connect() as conn:
-        row = conn.execute(sql, {"date": match_date, "home": home_team, "away": away_team}).fetchone()
-    if row and row[0] is not None:
-        bh, bd, ba = row
-        feat["home_prob_implied"] = float(1.0 / bh) if bh else np.nan
-        feat["draw_prob_implied"] = float(1.0 / bd) if bd else np.nan
-        feat["away_prob_implied"] = float(1.0 / ba) if ba else np.nan
-        # normalize
-        s = feat["home_prob_implied"] + feat["draw_prob_implied"] + feat["away_prob_implied"]
-        if s and s > 0:
-            feat["home_prob_implied"] /= s
-            feat["draw_prob_implied"] /= s
-            feat["away_prob_implied"] /= s
-    else:
-        feat["home_prob_implied"] = np.nan
-        feat["draw_prob_implied"] = np.nan
-        feat["away_prob_implied"] = np.nan
-
-    # Derived features used in training
-    feat["form_diff"] = (feat.get("home_is_win_avg_5") or 0) - (feat.get("away_is_win_avg_5") or 0)
-    feat["strength_diff"] = (feat.get("home_attack_strength_5") or 0) - (feat.get("away_defense_strength_5") or 0)
-    feat["total_avg_goals"] = (feat.get("home_attack_strength_5") or 0) + (feat.get("away_attack_strength_5") or 0)
-
-    # Reorder according to MODEL_META.features
-    order = MODEL_META["features"] # type: ignore
-    final = {k: float(feat.get(k)) if feat.get(k) is not None else np.nan for k in order} # type: ignore
-    return final
-
-def log_prediction(db_conn, resp: dict, model_id: Optional[int] = None, client_ip: Optional[str] = None, user_id: Optional[str] = None): # type: ignore
-    """
-    Insert a prediction log into prediction_logs table using an existing DB connection.
-    db_conn: a SQLAlchemy Connection or Session that supports execute()
-    resp: the response dict we return to the client
-    """
-    try:
-        insert_sql = text("""
-            INSERT INTO prediction_logs
-              (match_id, features, probabilities, implied_odds, edge, model_id, user_id, client_ip)
-            VALUES
-              (:match_id, :features, :probs, :implied, :edge, :model_id, :user_id, :client_ip)
-        """)
-        db_conn.execute(insert_sql, {
-            "match_id": resp.get("match_id"),
-            "features": json.dumps(resp.get("features", {})),
-            "probs": json.dumps(resp.get("probabilities", {})),
-            "implied": json.dumps(resp.get("implied_odds", {})),
-            "edge": json.dumps(resp.get("edge", {})),
-            "model_id": model_id,
-            "user_id": user_id,
-            "client_ip": client_ip
-        })
-        # commit if using Connection
-        try:
-            db_conn.commit()
-        except Exception:
-            # if db_conn is a raw Connection in SQLAlchemy, commit may be on the transaction context;
-            pass
-    except Exception as e:
-        # never block prediction on logging failure; log locally
-        print("Warning: failed to write prediction log:", e)
-        
-def predict_from_features_dict(features_dict: Dict[str, float]):
-    """
-    Accepts a dict with keys exactly equal to MODEL_META['features'] (or at least covering them).
-    Returns probability vector and other metadata.
-    """
-    # Build DataFrame for single row
-    feature_names = MODEL_META["features"] # pyright: ignore[reportOptionalSubscript]
-    X_df = pd.DataFrame([features_dict], columns=feature_names)
-
-    # Preprocess (impute/scale) using PREPROCESSOR
-    X_prep = PREPROCESSOR.transform(X_df)  # type: ignore 
-
-    if MODEL_META.get("model_type") == "sklearn_xgb":  # type: ignore 
-        model = SKLEARN_MODEL
-        probs = model.predict_proba(X_prep)[0]  # type: ignore 
-    else:
-        # booster: use DMatrix created from DataFrame with proper column names
-        dmat = xgb.DMatrix(pd.DataFrame(X_prep, columns=feature_names), feature_names=feature_names)
-        probs = BOOSTER.predict(dmat)[0]  # type: ignore 
-
-    # Build implied odds and edge (if implied present)
-    implied = {k: float(features_dict.get(k)) for k in ["home_prob_implied", "draw_prob_implied", "away_prob_implied"]}  # type: ignore 
-    # if implied are NaN, set None
-    implied = { "home": implied.get("home_prob_implied") or None,
-                "draw": implied.get("draw_prob_implied") or None,
-                "away": implied.get("away_prob_implied") or None }
-
-    p = {"home": float(probs[0]), "draw": float(probs[1]), "away": float(probs[2])}
-    edge = {}
-    for k in ("home","draw","away"):
-        if implied[k] is None or implied[k] != implied[k]:  # NaN check
-            edge[k] = None
-        else:
-            edge[k] = float(p[k] - implied[k])  # type: ignore 
-
-    return p, implied, edge
 
 def load_model_by_id(model_id: int):
     """
-    Load model by id from model_registry (DB).
+    Load model by id from model_registry (DB). This will:
+      - query model_registry for the record (using mappings() so columns accessible by name),
+      - resolve artifact_url / preprocessor_url or find local files,
+      - set MODEL_META and load PREPROCESSOR and MODEL into global state.
+    Returns True on success, raises RuntimeError on failure.
     """
     global MODEL_META, PREPROCESSOR, BOOSTER, SKLEARN_MODEL, MODEL
 
@@ -503,19 +377,15 @@ def load_model_by_id(model_id: int):
     engine = create_engine(DATABASE_URL)
     with engine.connect() as conn:
         row = conn.execute(
-            text("""
-                SELECT id, model_name, artifact_path, metadata
-                FROM model_registry
-                WHERE id = :id
-            """),
+            text("SELECT id, model_name, artifact_path, metadata FROM model_registry WHERE id = :id"),
             {"id": model_id}
         ).mappings().fetchone()
 
     if not row:
         raise RuntimeError(f"Model id {model_id} not found in registry")
 
-    artifact_path = row["artifact_path"]
-    metadata = row["metadata"]
+    artifact_path = row.get("artifact_path")
+    metadata = row.get("metadata")
     if isinstance(metadata, str):
         try:
             metadata = json.loads(metadata)
@@ -532,18 +402,22 @@ def load_model_by_id(model_id: int):
     resolved_preproc = None
     resolved_model = None
 
+    # try resolve preprocessor URL/path first
     if preproc_path_raw:
         try:
-            resolved_preproc = _resolve_artifact_path(preproc_path_raw, meta_dir=meta_dir) # type: ignore
+            resolved_preproc = _resolve_artifact_path(preproc_path_raw, meta_dir=meta_dir)  # type: ignore
         except Exception as e:
-            print("load_model_by_id: failed to resolve preprocessor:", e)
+            print(f"load_model_by_id: failed to resolve preprocessor: {e}")
 
+    # try resolve artifact_raw as URL/path
     if artifact_raw:
         try:
-            resolved_model = _resolve_artifact_path(artifact_raw, meta_dir=meta_dir) # type: ignore
+            resolved_model = _resolve_artifact_path(artifact_raw, meta_dir=meta_dir)  # type: ignore
         except Exception as e:
-            print("load_model_by_id: failed to resolve model artifact:", e)
+            print(f"load_model_by_id: failed to resolve model artifact: {e}")
+            resolved_model = None
 
+    # fallback: try to find preprocessor next to local artifacts
     if resolved_preproc is None:
         for candidate in Path("app/artifacts").glob("preprocessor_*.joblib"):
             resolved_preproc = str(candidate)
@@ -557,12 +431,9 @@ def load_model_by_id(model_id: int):
             print(f"load_model_by_id: failed to load preprocessor {resolved_preproc}: {e}")
             PREPROCESSOR = None
 
+    # fallback: search project for model files if not resolved
     if not resolved_model:
-        candidates = (
-            list(Path("app/models").glob("*")) +
-            list(Path("models").glob("*")) +
-            list(Path("app/artifacts").glob("xgb_booster_*.*"))
-        )
+        candidates = list(Path("app/models").glob("*")) + list(Path("models").glob("*")) + list(Path("app/artifacts").glob("*"))
         for c in candidates:
             name = c.name.lower()
             if "model_meta_" in name:
@@ -591,9 +462,323 @@ def load_model_by_id(model_id: int):
     except Exception as e:
         raise RuntimeError(f"Failed to load model artifact {resolved_model}: {e}")
 
+
+def fetch_recent_team_matches(team: str, cutoff_date: str, limit: int = 10):
+    """Fetch last N matches for team before cutoff_date from database (both home and away)."""
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL not configured")
+    engine = create_engine(DATABASE_URL)  # type: ignore
+    sql = text("""
+        SELECT date, home_team, away_team,
+               full_time_home_goals, full_time_away_goals,
+               home_shots, away_shots, home_shots_on_target, away_shots_on_target,
+               home_corners, away_corners, full_time_result,
+               b365_home_odds, b365_draw_odds, b365_away_odds
+        FROM public.matches
+        WHERE date < :cutoff
+          AND (home_team = :team OR away_team = :team)
+        ORDER BY date DESC
+        LIMIT :limit
+    """)
+    with engine.connect() as conn:
+        df = pd.read_sql(sql, conn, params={"cutoff": cutoff_date, "team": team, "limit": limit})
+    return df
+
+
+def compute_rolling_features_for_team(team_df: pd.DataFrame, team_name: str, window: int = 5, is_home_perspective=True):
+    """
+    Compute aggregates used in training for a single team from its past matches.
+    team_df expected ordered DESC (most recent first).
+    Returns Python-native floats or None (no np.nan).
+    """
+    if team_df is None or team_df.empty:
+        return {
+            "is_win_avg": None,
+            "is_win_form_3": None,
+            "goal_diff_avg": None,
+            "shots_avg": None,
+            "shots_on_target_avg": None,
+            "corners_avg": None,
+            "attack_strength": None,
+            "defense_strength": None
+        }
+
+    df = team_df.copy()
+
+    def row_perspective(row):
+        if row.get("home_team") == team_name:
+            gf = row.get("full_time_home_goals")
+            ga = row.get("full_time_away_goals")
+            shots = row.get("home_shots")
+            sots = row.get("home_shots_on_target")
+            corners = row.get("home_corners")
+            result = row.get("full_time_result")
+            is_win = 1 if result == "H" else 0
+        else:
+            gf = row.get("full_time_away_goals")
+            ga = row.get("full_time_home_goals")
+            shots = row.get("away_shots")
+            sots = row.get("away_shots_on_target")
+            corners = row.get("away_corners")
+            result = row.get("full_time_result")
+            is_win = 1 if result == "A" else 0
+        gf = pd.to_numeric(gf, errors="coerce")
+        ga = pd.to_numeric(ga, errors="coerce")
+        shots = pd.to_numeric(shots, errors="coerce")
+        sots = pd.to_numeric(sots, errors="coerce")
+        corners = pd.to_numeric(corners, errors="coerce")
+        return {
+            "gf": gf,
+            "ga": ga,
+            "goal_diff": (gf - ga) if (pd.notna(gf) and pd.notna(ga)) else np.nan,
+            "shots": shots,
+            "sots": sots,
+            "corners": corners,
+            "is_win": is_win
+        }
+
+    stats_df = df.apply(lambda r: pd.Series(row_perspective(r)), axis=1)
+    lastk = stats_df.head(window)
+
+    def col_mean_safe(series):
+        if series is None or series.empty:
+            return None
+        val = series.mean(skipna=True)
+        if pd.isna(val):
+            return None
+        return float(val)
+
+    res = {
+        "is_win_avg": col_mean_safe(lastk["is_win"]),
+        "is_win_form_3": col_mean_safe(lastk["is_win"].head(3)),
+        "goal_diff_avg": col_mean_safe(lastk["goal_diff"]),
+        "shots_avg": col_mean_safe(lastk["shots"]),
+        "shots_on_target_avg": col_mean_safe(lastk["sots"]),
+        "corners_avg": col_mean_safe(lastk["corners"]),
+        "attack_strength": col_mean_safe(lastk["gf"]) if "gf" in lastk.columns else None,
+        "defense_strength": col_mean_safe(lastk["ga"]) if "ga" in lastk.columns else None
+    }
+    return res
+
+
+def build_feature_vector_from_db(home_team: str, away_team: str, match_date: str, window: int = 5):
+    """
+    Compute the final feature dict exactly matching MODEL_META['features'] order.
+    Returns a dict of Python floats or None (no numpy NaN).
+    """
+    home_hist = fetch_recent_team_matches(home_team, cutoff_date=match_date, limit=20)
+    away_hist = fetch_recent_team_matches(away_team, cutoff_date=match_date, limit=20)
+
+    home_feats = compute_rolling_features_for_team(home_hist, home_team, window=window)
+    away_feats = compute_rolling_features_for_team(away_hist, away_team, window=window)
+
+    feat = {
+        "home_shots": home_feats.get("shots_avg"),
+        "away_shots": away_feats.get("shots_avg"),
+        "home_shots_on_target": home_feats.get("shots_on_target_avg"),
+        "away_shots_on_target": away_feats.get("shots_on_target_avg"),
+        "home_corners": home_feats.get("corners_avg"),
+        "away_corners": away_feats.get("corners_avg"),
+        "home_is_win_avg_5": home_feats.get("is_win_avg"),
+        "home_is_win_form_3": home_feats.get("is_win_form_3"),
+        "home_goal_diff_avg_5": home_feats.get("goal_diff_avg"),
+        "home_shots_avg_5": home_feats.get("shots_avg"),
+        "home_shots_on_target_avg_5": home_feats.get("shots_on_target_avg"),
+        "home_corners_avg_5": home_feats.get("corners_avg"),
+        "home_attack_strength_5": home_feats.get("attack_strength"),
+        "home_defense_strength_5": home_feats.get("defense_strength"),
+        "away_is_win_avg_5": away_feats.get("is_win_avg"),
+        "away_is_win_form_3": away_feats.get("is_win_form_3"),
+        "away_goal_diff_avg_5": away_feats.get("goal_diff_avg"),
+        "away_shots_avg_5": away_feats.get("shots_avg"),
+        "away_shots_on_target_avg_5": away_feats.get("shots_on_target_avg"),
+        "away_corners_avg_5": away_feats.get("corners_avg"),
+        "away_attack_strength_5": away_feats.get("attack_strength"),
+        "away_defense_strength_5": away_feats.get("defense_strength"),
+    }
+
+    # implied odds retrieval
+    bh = bd = ba = None
+    if DATABASE_URL:
+        engine = create_engine(DATABASE_URL)  # type: ignore
+        sql = text("""
+           SELECT b365_home_odds, b365_draw_odds, b365_away_odds
+           FROM public.matches
+           WHERE date < :date
+             AND ((home_team = :home AND away_team = :away) OR (home_team = :away AND away_team = :home))
+           ORDER BY date DESC
+           LIMIT 1
+        """)
+        with engine.connect() as conn:
+            row = conn.execute(sql, {"date": match_date, "home": home_team, "away": away_team}).fetchone()
+        if row:
+            try:
+                bh = row["b365_home_odds"] # type: ignore
+                bd = row["b365_draw_odds"] # type: ignore
+                ba = row["b365_away_odds"] # type: ignore
+            except Exception:
+                try:
+                    bh, bd, ba = row[0], row[1], row[2]
+                except Exception:
+                    bh = bd = ba = None
+
+    def odds_to_prob(x):
+        try:
+            if x is None:
+                return None
+            xv = float(x)
+            if xv == 0:
+                return None
+            return float(1.0 / xv)
+        except Exception:
+            return None
+
+    feat["home_prob_implied"] = odds_to_prob(bh)
+    feat["draw_prob_implied"] = odds_to_prob(bd)
+    feat["away_prob_implied"] = odds_to_prob(ba)
+
+    ph = feat.get("home_prob_implied")
+    pd_raw = feat.get("draw_prob_implied")
+    pa = feat.get("away_prob_implied")
+    if ph is not None and pd_raw is not None and pa is not None:
+        s = ph + pd_raw + pa
+        if s > 0:
+            feat["home_prob_implied"] = ph / s
+            feat["draw_prob_implied"] = pd_raw / s
+            feat["away_prob_implied"] = pa / s
+
+    # Derived features
+    feat["form_diff"] = None
+    if feat.get("home_is_win_avg_5") is not None or feat.get("away_is_win_avg_5") is not None:
+        h = feat.get("home_is_win_avg_5") or 0.0
+        a = feat.get("away_is_win_avg_5") or 0.0
+        feat["form_diff"] = float(h - a)
+
+    feat["strength_diff"] = None
+    if feat.get("home_attack_strength_5") is not None or feat.get("away_defense_strength_5") is not None:
+        ha = feat.get("home_attack_strength_5") or 0.0
+        ad = feat.get("away_defense_strength_5") or 0.0
+        feat["strength_diff"] = float(ha - ad)
+
+    feat["total_avg_goals"] = None
+    if feat.get("home_attack_strength_5") is not None or feat.get("away_attack_strength_5") is not None:
+        ha2 = feat.get("home_attack_strength_5") or 0.0
+        aa2 = feat.get("away_attack_strength_5") or 0.0
+        feat["total_avg_goals"] = float(ha2 + aa2)
+
+    # Reorder according to MODEL_META.features (ensure keys exist)
+    order = MODEL_META.get("features") if MODEL_META else list(feat.keys())
+    final = {}
+    for k in order:  # type: ignore
+        v = feat.get(k)
+        if v is None:
+            final[k] = None
+        else:
+            try:
+                final[k] = float(v)
+            except Exception:
+                final[k] = None
+
+    final_safe = sanitize_for_json(final)
+    return final_safe
+
+
+def log_prediction(db_conn, resp: dict, model_id: Optional[int] = None, client_ip: Optional[str] = None, user_id: Optional[str] = None):
+    """
+    Insert a prediction log into prediction_logs table using an existing DB connection.
+    db_conn: SQLAlchemy Session or Connection from get_db()
+    resp: the response dict we return to the client
+    """
+    try:
+        features_safe = sanitize_for_json(resp.get("features", {}))
+        probs_safe = sanitize_for_json(resp.get("probabilities", {}))
+        implied_safe = sanitize_for_json(resp.get("implied_odds", {}))
+        edge_safe = sanitize_for_json(resp.get("edge", {}))
+
+        features_json = json.dumps(features_safe)
+        probs_json = json.dumps(probs_safe)
+        implied_json = json.dumps(implied_safe)
+        edge_json = json.dumps(edge_safe)
+
+        insert_sql = text("""
+            INSERT INTO prediction_logs
+              (match_id, features, probabilities, implied_odds, edge, model_id, user_id, client_ip)
+            VALUES
+              (:match_id, :features, :probs, :implied, :edge, :model_id, :user_id, :client_ip)
+        """)
+
+        res = db_conn.execute(insert_sql, {
+            "match_id": resp.get("match_id"),
+            "features": features_json,
+            "probs": probs_json,
+            "implied": implied_json,
+            "edge": edge_json,
+            "model_id": model_id,
+            "user_id": user_id,
+            "client_ip": client_ip
+        })
+
+        try:
+            db_conn.commit()
+        except Exception:
+            pass
+
+    except Exception as e:
+        print("Warning: failed to write prediction log:", e)
+
+
+def predict_from_features_dict(features_dict: Dict[str, float]):
+    """
+    Accepts a dict with keys exactly equal to MODEL_META['features'] (or at least covering them).
+    Returns probability dict (home,draw,away), implied dict and edge dict (all sanitized).
+    """
+    feature_names = MODEL_META["features"]  # type: ignore
+    row = {fn: features_dict.get(fn) for fn in feature_names}
+    X_df = pd.DataFrame([row], columns=feature_names)
+
+    X_prep = PREPROCESSOR.transform(X_df)  # type: ignore
+
+    if MODEL_META.get("model_type") == "sklearn_xgb":  # type: ignore
+        model = SKLEARN_MODEL
+        probs_arr = model.predict_proba(X_prep)[0]  # type: ignore
+    else:
+        dmat = xgb.DMatrix(pd.DataFrame(X_prep, columns=feature_names), feature_names=feature_names)
+        probs_arr = BOOSTER.predict(dmat)[0]  # type: ignore
+
+    probs = {"home": float(probs_arr[0]), "draw": float(probs_arr[1]), "away": float(probs_arr[2])}
+
+    implied_home = features_dict.get("home_prob_implied")
+    implied_draw = features_dict.get("draw_prob_implied")
+    implied_away = features_dict.get("away_prob_implied")
+
+    implied = {
+        "home": sanitize_for_json(implied_home),
+        "draw": sanitize_for_json(implied_draw),
+        "away": sanitize_for_json(implied_away)
+    }
+
+    # compute edge: if implied is None, produce None for edge
+    def compute_edge(p_val, implied_val):
+        if implied_val is None:
+            return None
+        return float(p_val - float(implied_val))
+
+    edge_calc = {
+        "home": compute_edge(probs["home"], implied["home"]),
+        "draw": compute_edge(probs["draw"], implied["draw"]),
+        "away": compute_edge(probs["away"], implied["away"])
+    }
+
+    probs_safe = sanitize_for_json(probs)
+    implied_safe = sanitize_for_json(implied)
+    edge_safe = sanitize_for_json(edge_calc)
+
+    return probs_safe, implied_safe, edge_safe
+
+
 # ---- endpoints ----
 @router.post("/match", response_model=PredictResponse)
-def predict_match(req: MatchRequest = Body(...), request: Request = None, db = Depends(get_db)): # type: ignore
+def predict_match(req: MatchRequest = Body(...), request: Request = None, db=Depends(get_db)):  # type: ignore
     """
     Predict endpoint.
     - mode=auto or server: API computes features from DB then predicts.
@@ -602,32 +787,35 @@ def predict_match(req: MatchRequest = Body(...), request: Request = None, db = D
     if MODEL_META is None or PREPROCESSOR is None or MODEL is None:
         raise HTTPException(status_code=503, detail="Model not loaded yet")
 
-    mode = req.mode.lower()
+    mode = (req.mode or "auto").lower()
     if mode in ("auto", "server"):
-        # compute features server-side
         features_dict = build_feature_vector_from_db(req.home_team, req.away_team, req.match_date)
     elif mode == "features":
         if not req.features:
             raise HTTPException(status_code=400, detail="features payload required when mode='features'")
-        # ensure keys map to numeric type
-        features_dict = {k: float(v) for k, v in req.features.items()}
-        # if keys are not in meta features, attempt to subset or error
+        # allow optional numeric values, coerce where possible
+        features_dict = {k: (None if v is None else float(v)) for k, v in req.features.items()}
         missing = [f for f in MODEL_META["features"] if f not in features_dict]
         if missing:
             raise HTTPException(status_code=400, detail=f"Missing required feature keys: {missing}")
     else:
         raise HTTPException(status_code=400, detail="mode must be one of: auto|server|features")
 
-    # predict
-    probs, implied, edge = predict_from_features_dict(features_dict)
+    probs, implied, edge = predict_from_features_dict(features_dict)  # type: ignore
 
-    match_id = f"{req.match_date}_{req.home_team.replace(' ','')}_{req.away_team.replace(' ','')}"
+    match_id = f"{req.match_date}_{req.home_team.replace(' ', '')}_{req.away_team.replace(' ', '')}"
+    # sanitize the pieces before returning
+    features_safe = sanitize_for_json(features_dict)
+    implied_safe = sanitize_for_json(implied)
+    edge_safe = sanitize_for_json(edge)
+    probs_safe = sanitize_for_json(probs)
+
     resp = {
         "match_id": match_id,
-        "features": features_dict,
-        "probabilities": probs,
-        "implied_odds": {"home": implied["home"], "draw": implied["draw"], "away": implied["away"]},
-        "edge": edge,
+        "features": features_safe,
+        "probabilities": probs_safe,
+        "implied_odds": {"home": implied_safe.get("home"), "draw": implied_safe.get("draw"), "away": implied_safe.get("away")}, # type: ignore
+        "edge": {"home": edge_safe.get("home"), "draw": edge_safe.get("draw"), "away": edge_safe.get("away")}, # type: ignore
         "model_meta": {
             "created_at": MODEL_META.get("created_at"),
             "model_type": MODEL_META.get("model_type"),
@@ -636,33 +824,28 @@ def predict_match(req: MatchRequest = Body(...), request: Request = None, db = D
         }
     }
 
-        # try to find active model id in DB (optional)
+    # find active model id (best-effort)
     model_id = None
     try:
         row = db.execute(text("SELECT id FROM model_registry WHERE is_active = true ORDER BY created_at DESC LIMIT 1")).fetchone()
         if row:
-            # row may be tuple-like or mapping
             try:
-                model_id = int(row['id'])
+                model_id = int(row["id"])
             except Exception:
                 model_id = int(row[0])
     except Exception as e:
-        # ignore DB read failure (we still want to return prediction)
         print("Warning: cannot read active model from DB:", e)
 
-    # client IP
     client_ip = None
     try:
         client_ip = request.client.host if request and request.client else None
     except Exception:
         client_ip = None
 
-    # optional: user_id if you have authentication. We'll leave None for now.
     user_id = None
 
-    # Log prediction (best-effort)
     try:
-        log_prediction(db, resp, model_id=model_id, client_ip=client_ip, user_id=user_id) # type: ignore
+        log_prediction(db, resp, model_id=model_id, client_ip=client_ip, user_id=user_id)  # type: ignore
     except Exception as e:
         print("Warning: log_prediction raised:", e)
 
