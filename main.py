@@ -2,19 +2,27 @@ from fastapi import FastAPI, Depends
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from fastapi.middleware.cors import CORSMiddleware
+from app.middleware.rate_limiter import init_rate_limiter
+from app.middleware.auth_middleware import TokenPayloadMiddleware
 from app.api.predict import router as predict_router, load_model_at_startup
 from app.api.admin_models import router as admin_models_router
 from app.api.auth import router as auth_router
 from app.api.llm_analysis import router as llm_router
 
 
-from app.db.database import get_db
+# from app.db.database import get_db
 
 app = FastAPI(
     title="Football Match Prediction API",
     description="API for match prediction project",
     version="1.0.0"
 )
+
+# token payload middleware
+app.add_middleware(TokenPayloadMiddleware)
+
+# init limiter
+init_rate_limiter(app)
 
 # Allow CORS in dev (lock down in prod)
 app.add_middleware(

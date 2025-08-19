@@ -1,7 +1,7 @@
 # app/api/auth.py
 from datetime import datetime, timedelta
 import os
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
@@ -10,7 +10,7 @@ from passlib.context import CryptContext
 from sqlalchemy import text
 
 from app.db.database import get_db
-from app.core.auth import admin_required, get_current_user  
+from app.core.auth import admin_required, get_current_user, JWT_SECRET, JWT_ALGORITHM
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -98,6 +98,55 @@ def login_for_access_token(
     access_token = create_access_token(payload)
     return {"access_token": access_token, "token_type": "bearer"}
 
+class RegisterRequest(dict):
+    # simple container if you want to pydantic later
+    pass
+
+@router.post("/register", status_code=201)
+def register_user(request_body: Dict[str, Any], db = Depends(get_db)):
+    """
+    Register a new user.
+    JSON body: {"username": "...", "email": "...", "password": "..."}
+    Note: this endpoint creates non-admin users only. To create admin users, use database or an admin-only route.
+    """
+    username = (request_body.get("username") or request_body.get("email") or "").strip()
+    email = (request_body.get("email") or request_body.get("username") or "").strip()
+    password = request_body.get("password")
+
+    if not password or not (username or email):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="username/email and password required")
+
+    # check for existing user
+    existing = db.execute(
+        text("SELECT id FROM users WHERE email = :email OR username = :username LIMIT 1"),
+        {"email": email, "username": username}
+    ).fetchone()
+    if existing:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="User with that email or username already exists")
+
+    # hash password
+    hashed = pwd_context.hash(password)
+
+    # Insert user (adjust columns to match your DB schema)
+    insert_sql = text(
+        "INSERT INTO users (username, email, password_hash, is_admin, created_at) VALUES (:username, :email, :password_hash, false, now()) RETURNING id"
+    )
+    res = db.execute(insert_sql, {"username": username, "email": email, "password_hash": hashed})
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to create user: {e}")
+
+    row = res.fetchone()
+    if not row:
+        raise HTTPException(status_code=500, detail="User creation failed")
+    user_id = row[0]
+
+    # return a token for convenience
+    payload = {"sub": str(user_id), "email": email, "is_admin": False}
+    token = create_access_token(payload)
+    return {"id": user_id, "access_token": token, "token_type": "bearer"}
 
 # Useful helper endpoints for testing
 @router.get("/me")

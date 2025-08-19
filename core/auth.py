@@ -24,7 +24,6 @@ def decode_jwt(token: str) -> Dict[str, Any]:
     except JWTError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid authentication credentials")
 
-
 def get_current_user(token: str = Depends(oauth2_scheme), db=Depends(get_db)):
     payload = decode_jwt(token)
     user_id = payload.get("sub")

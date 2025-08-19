@@ -1,5 +1,5 @@
 # app/api/llm_analysis.py
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Request
 from typing import Dict, Any, Optional, Union, Tuple
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
@@ -11,14 +11,20 @@ import traceback
 import logging
 from pydantic import BaseModel, Field
 from datetime import datetime
+from app.core.auth import get_current_user, admin_required
+from app.middleware.rate_limiter import limiter as rate_limiter  # use limiter instance
+from slowapi.util import get_remote_address
 
-# Configure logging
+import joblib
+import xgboost as xgb
+from pathlib import Path
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/predict", tags=["predict_enriched"])
 
+
 class MatchRequest(BaseModel):
-    """Validated match request schema"""
     home_team: str = Field(..., min_length=1, max_length=100)
     away_team: str = Field(..., min_length=1, max_length=100)
     date: Optional[str] = Field(None, description="Match date in YYYY-MM-DD format")
@@ -30,8 +36,8 @@ class MatchRequest(BaseModel):
     features: Optional[Dict[str, Any]] = Field(None, description="Feature vector when mode=features")
     match_date: Optional[str] = Field(None, description="Alias for date field for compatibility")
 
+
 class PredictionResponse(BaseModel):
-    """Response schema for enriched predictions"""
     model: Dict[str, Any]
     llm_raw: str
     llm_parsed: Dict[str, Any]
@@ -39,37 +45,23 @@ class PredictionResponse(BaseModel):
     processing_time_ms: int
     error: Optional[str] = None
 
+
 # Try to import existing predict function with better error handling
 predict_match_helper = None
 try:
-    # Import both the function and the router to avoid dependency issues
-    from app.api.predict import predict_match as predict_match_helper
+    from app.api.predict import predict_match as predict_match_helper  # type: ignore
     logger.info("Successfully imported predict_match helper")
 except ImportError as e:
     logger.warning(f"Could not import predict_match helper: {e}")
 except Exception as e:
     logger.error(f"Unexpected error importing predict_match helper: {e}")
 
-# Also try to import the original MatchRequest for compatibility
-original_match_request = None
-try:
-    from app.api.predict import MatchRequest as OriginalMatchRequest
-    original_match_request = OriginalMatchRequest
-    logger.info("Successfully imported original MatchRequest")
-except ImportError as e:
-    logger.warning(f"Could not import original MatchRequest: {e}")
-except Exception as e:
-    logger.error(f"Unexpected error importing original MatchRequest: {e}")
 
 def _get_base_prediction(match_request: Union[Dict[str, Any], MatchRequest]) -> Dict[str, Any]:
-    """
-    Get base model prediction with multiple fallback strategies
-    """
     if predict_match_helper:
         try:
-            # Convert dict to MatchRequest object if needed
+            # create compatible object if a dict was passed
             if isinstance(match_request, dict):
-                # Create a MatchRequest object from the dictionary
                 request_obj = MatchRequest(
                     home_team=match_request.get("home_team", ""),
                     away_team=match_request.get("away_team", ""),
@@ -84,24 +76,17 @@ def _get_base_prediction(match_request: Union[Dict[str, Any], MatchRequest]) -> 
                 )
             else:
                 request_obj = match_request
-                # Ensure match_date is set if not provided
                 if not request_obj.match_date:
                     request_obj.match_date = request_obj.date
-            
-            # Call the prediction function directly
-            base = predict_match_helper(request_obj) # type: ignore
+
+            base = predict_match_helper(request_obj, request=None)  # type: ignore
             logger.info("Successfully got prediction from helper")
             return base
-                
         except Exception as e:
             logger.error(f"Prediction helper failed: {e}")
-            logger.error(f"Full traceback: {traceback.format_exc()}")
-            raise HTTPException(
-                status_code=500, 
-                detail=f"Prediction helper failed: {str(e)}"
-            )
+            logger.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=f"Prediction helper failed: {str(e)}")
     else:
-        # Create a mock prediction for testing/development
         logger.warning("No prediction helper available, using mock data")
         return {
             "features": {
@@ -123,58 +108,48 @@ def _get_base_prediction(match_request: Union[Dict[str, Any], MatchRequest]) -> 
             }
         }
 
+
 def _validate_base_prediction(base: Dict[str, Any]) -> None:
-    """Validate the structure of base prediction"""
     if not isinstance(base, dict):
         raise HTTPException(status_code=500, detail="Prediction must return a dictionary")
-    
+
     probs = base.get("probabilities", {})
     if not probs:
         raise HTTPException(status_code=500, detail="Prediction returned no probabilities")
-    
-    # Check if probabilities are valid
+
     required_outcomes = ["home", "draw", "away"]
     for outcome in required_outcomes:
         if outcome not in probs:
-            raise HTTPException(
-                status_code=500, 
-                detail=f"Missing probability for outcome: {outcome}"
-            )
+            raise HTTPException(status_code=500, detail=f"Missing probability for outcome: {outcome}")
         if not isinstance(probs[outcome], (int, float)) or probs[outcome] < 0 or probs[outcome] > 1:
-            raise HTTPException(
-                status_code=500, 
-                detail=f"Invalid probability for {outcome}: {probs[outcome]}"
-            )
-    
-    # Check if probabilities sum to approximately 1.0
+            raise HTTPException(status_code=500, detail=f"Invalid probability for {outcome}: {probs[outcome]}")
+
     total_prob = sum(probs.values())
     if abs(total_prob - 1.0) > 0.1:
         logger.warning(f"Probabilities don't sum to 1.0: {total_prob}")
 
+
 def _generate_match_id(match_request: Union[Dict[str, Any], MatchRequest]) -> str:
-    """Generate a unique match ID"""
     if isinstance(match_request, MatchRequest):
         match_dict = match_request.model_dump()
     else:
         match_dict = match_request
-    
+
     if match_dict.get("match_id"):
         return str(match_dict["match_id"])
-    
+
     date = match_dict.get("date", datetime.utcnow().strftime("%Y-%m-%d"))
     home = match_dict.get("home_team", "unknown")
     away = match_dict.get("away_team", "unknown")
-    
-    # Clean team names for ID generation
+
     home_clean = "".join(c for c in home if c.isalnum())[:20]
     away_clean = "".join(c for c in away if c.isalnum())[:20]
-    
+
     return f"{date}_{home_clean}_{away_clean}"
 
+
 def _create_cache_table(db) -> bool:
-    """Create cache table if it doesn't exist"""
     try:
-        # Fixed the duplicate "IF NOT EXISTS" in your original SQL
         db.execute(text("""
             CREATE TABLE IF NOT EXISTS llm_analysis_cache (
                 id SERIAL PRIMARY KEY,
@@ -187,13 +162,7 @@ def _create_cache_table(db) -> bool:
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """))
-        
-        # Create index for faster lookups
-        db.execute(text("""
-            CREATE INDEX IF NOT EXISTS idx_llm_cache_match_id 
-            ON llm_analysis_cache(match_id)
-        """))
-        
+        db.execute(text("CREATE INDEX IF NOT EXISTS idx_llm_cache_match_id ON llm_analysis_cache(match_id)"))
         db.commit()
         return True
     except SQLAlchemyError as e:
@@ -201,44 +170,41 @@ def _create_cache_table(db) -> bool:
         db.rollback()
         return False
 
+
 def _get_cached_analysis(db, match_id: str) -> Optional[Tuple[str, Dict[str, Any]]]:
-    """Retrieve cached LLM analysis"""
     try:
         query = text("""
-            SELECT llm_raw, llm_parsed 
-            FROM llm_analysis_cache 
-            WHERE match_id = :mid 
-            ORDER BY created_at DESC 
+            SELECT llm_raw, llm_parsed
+            FROM llm_analysis_cache
+            WHERE match_id = :mid
+            ORDER BY created_at DESC
             LIMIT 1
         """)
         result = db.execute(query, {"mid": match_id}).fetchone()
-        
         if result and result[0]:
             llm_raw = result[0]
             llm_parsed = result[1] if result[1] else {"text": llm_raw}
             logger.info(f"Retrieved cached analysis for match_id: {match_id}")
             return llm_raw, llm_parsed
-        
         return None
     except SQLAlchemyError as e:
         logger.error(f"Failed to retrieve cached analysis: {e}")
         return None
 
+
 def _save_to_cache(db, match_id: str, base: Dict[str, Any], llm_raw: str, llm_parsed: Dict[str, Any]) -> bool:
-    """Save analysis to cache"""
     try:
         upsert_query = text("""
             INSERT INTO llm_analysis_cache (match_id, model_meta, model_probs, llm_raw, llm_parsed, updated_at)
             VALUES (:mid, :meta, :probs, :raw, :parsed, CURRENT_TIMESTAMP)
-            ON CONFLICT (match_id) 
-            DO UPDATE SET 
+            ON CONFLICT (match_id)
+            DO UPDATE SET
                 model_meta = EXCLUDED.model_meta,
                 model_probs = EXCLUDED.model_probs,
                 llm_raw = EXCLUDED.llm_raw,
                 llm_parsed = EXCLUDED.llm_parsed,
                 updated_at = CURRENT_TIMESTAMP
         """)
-        
         db.execute(upsert_query, {
             "mid": match_id,
             "meta": json.dumps(base.get("model_meta", {})),
@@ -254,36 +220,31 @@ def _save_to_cache(db, match_id: str, base: Dict[str, Any], llm_raw: str, llm_pa
         db.rollback()
         return False
 
+
 @router.post("/enriched", response_model=PredictionResponse)
+@rate_limiter.limit("60/minute")  # type: ignore
 def predict_enriched(
-    match_request: MatchRequest, 
-    db = Depends(get_db), 
+    request: Request,
+    match_request: MatchRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db = Depends(get_db),
     use_cache: bool = True,
     force_refresh: bool = False
 ):
     """
     Enhanced endpoint that combines model predictions with LLM analysis.
-    
-    Args:
-        match_request: Match details (home_team, away_team, date, etc.)
-        use_cache: Whether to use cached results
-        force_refresh: Force fresh LLM analysis even if cached
-    
-    Returns:
-        Combined model and LLM analysis with caching info
+    - `request` is required for slowapi rate-limiter.
+    - `current_user` is DB-validated user dict.
+    - `db` is the DB session/connection.
     """
     start_time = datetime.utcnow()
-    
     try:
-        # 1) Get base model prediction
         logger.info(f"Getting base prediction for {match_request.home_team} vs {match_request.away_team}")
         base = _get_base_prediction(match_request)
         _validate_base_prediction(base)
-        
-        # 2) Generate match ID
+
         match_id = _generate_match_id(match_request)
-        
-        # 3) Prepare match info dict
+
         match_info = {
             "home_team": match_request.home_team,
             "away_team": match_request.away_team,
@@ -291,18 +252,15 @@ def predict_enriched(
             "league": match_request.league,
             "venue": match_request.venue
         }
-        
-        # 4) Check cache first (unless force_refresh is True)
+
+        # Cache handling
         cached_result = None
         if use_cache and not force_refresh and db is not None:
-            # Ensure cache table exists
             _create_cache_table(db)
             cached_result = _get_cached_analysis(db, match_id)
-            
             if cached_result:
                 llm_raw, llm_parsed = cached_result
                 processing_time = int((datetime.utcnow() - start_time).total_seconds() * 1000)
-                
                 return PredictionResponse(
                     model=base,
                     llm_raw=llm_raw,
@@ -310,43 +268,36 @@ def predict_enriched(
                     cached=True,
                     processing_time_ms=processing_time
                 )
-        
-        # 5) Generate LLM analysis
-        logger.info("Generating fresh LLM analysis")
-        
-        # Extract recent stats from model features
+
+        # Build prompt
         recent_stats = {}
         features = base.get("features", {})
         if features:
-            # Map your model features to meaningful stats
             stat_mappings = {
                 "home_shots_avg_5": "Home shots (last 5)",
-                "away_shots_avg_5": "Away shots (last 5)", 
+                "away_shots_avg_5": "Away shots (last 5)",
                 "home_goals_avg_5": "Home goals (last 5)",
                 "away_goals_avg_5": "Away goals (last 5)",
                 "form_diff": "Form difference",
                 "home_win_rate": "Home win rate",
                 "away_win_rate": "Away win rate"
             }
-            
             for feature_key, display_name in stat_mappings.items():
                 if feature_key in features and features[feature_key] is not None:
                     recent_stats[display_name] = features[feature_key]
-        
-        # Build prompt and call LLM
+
         prompt = build_match_context(
             model_probs=base["probabilities"],
             match_info=match_info,
             recent_stats=recent_stats,
             extra_context=match_request.extra_context
         )
-        
+
         try:
             llm_raw, llm_parsed = call_gemini(prompt)
             logger.info("Successfully generated LLM analysis")
         except Exception as e:
             logger.error(f"LLM analysis failed: {e}")
-            # Return model prediction with error info instead of failing completely
             processing_time = int((datetime.utcnow() - start_time).total_seconds() * 1000)
             return PredictionResponse(
                 model=base,
@@ -356,13 +307,12 @@ def predict_enriched(
                 processing_time_ms=processing_time,
                 error=f"LLM analysis failed: {str(e)}"
             )
-        
-        # 6) Save to cache
+
         if use_cache and db is not None:
             _save_to_cache(db, match_id, base, llm_raw, llm_parsed)
-        
+
         processing_time = int((datetime.utcnow() - start_time).total_seconds() * 1000)
-        
+
         return PredictionResponse(
             model=base,
             llm_raw=llm_raw,
@@ -370,81 +320,22 @@ def predict_enriched(
             cached=False,
             processing_time_ms=processing_time
         )
-        
+
     except HTTPException:
-        # Re-raise HTTP exceptions as-is
         raise
     except Exception as e:
         logger.error(f"Unexpected error in predict_enriched: {e}\n{traceback.format_exc()}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Internal server error: {str(e)}"
-        )
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Internal server error: {str(e)}")
 
-# Additional debugging endpoint
-@router.post("/debug/base-prediction")
-def debug_base_prediction(match_request: MatchRequest):
-    """Debug endpoint to test base prediction function"""
-    try:
-        logger.info(f"Debug: Testing base prediction for {match_request.home_team} vs {match_request.away_team}")
-        
-        # Log the input we're sending
-        logger.info(f"Input type: {type(match_request)}")
-        logger.info(f"Input data: {match_request.model_dump()}")
-        
-        if predict_match_helper:
-            # Test different input formats
-            results = {}
-            
-            # Test 1: Pydantic object
-            try:
-                result1 = predict_match_helper(match_request) # type: ignore
-                results["pydantic_object"] = {"success": True, "result_type": str(type(result1))}
-            except Exception as e:
-                results["pydantic_object"] = {"success": False, "error": str(e)}
-            
-            # Test 2: Dictionary
-            try:
-                result2 = predict_match_helper(match_request.model_dump()) # type: ignore
-                results["dictionary"] = {"success": True, "result_type": str(type(result2))}
-            except Exception as e:
-                results["dictionary"] = {"success": False, "error": str(e)}
-            
-            # Test 3: With raw_output parameter
-            try:
-                result3 = predict_match_helper(match_request, raw_output=True) # type: ignore
-                results["with_raw_output"] = {"success": True, "result_type": str(type(result3))}
-            except Exception as e:
-                results["with_raw_output"] = {"success": False, "error": str(e)}
-            
-            return {
-                "helper_available": True,
-                "test_results": results,
-                "input_received": match_request.model_dump()
-            }
-        else:
-            return {
-                "helper_available": False,
-                "message": "predict_match_helper not imported",
-                "input_received": match_request.model_dump()
-            }
-            
-    except Exception as e:
-        logger.error(f"Debug endpoint failed: {e}")
-        return {
-            "error": str(e),
-            "traceback": traceback.format_exc(),
-            "input_received": match_request.model_dump() if hasattr(match_request, 'model_dump') else str(match_request)
-        }
 
 @router.get("/cache/stats")
-def get_cache_stats(db = Depends(get_db)):
-    """Get cache statistics"""
+@rate_limiter.limit("200/minute")  # type: ignore
+def get_cache_stats(request: Request, current_user: Dict[str, Any] = Depends(get_current_user), db = Depends(get_db)):
+    """Get cache statistics; request param required for rate limiter."""
     if db is None:
         raise HTTPException(status_code=503, detail="Database not available")
-    
+
     try:
-        # Check if cache table exists
         table_check = text("""
             SELECT EXISTS (
                 SELECT FROM information_schema.tables 
@@ -452,11 +343,10 @@ def get_cache_stats(db = Depends(get_db)):
             )
         """)
         table_exists = db.execute(table_check).scalar()
-        
+
         if not table_exists:
             return {"cache_enabled": False, "total_entries": 0}
-        
-        # Get cache statistics
+
         stats_query = text("""
             SELECT 
                 COUNT(*) as total_entries,
@@ -465,9 +355,9 @@ def get_cache_stats(db = Depends(get_db)):
                 MAX(created_at) as last_entry
             FROM llm_analysis_cache
         """)
-        
+
         result = db.execute(stats_query).fetchone()
-        
+
         return {
             "cache_enabled": True,
             "total_entries": result[0] if result else 0,
@@ -475,28 +365,31 @@ def get_cache_stats(db = Depends(get_db)):
             "entries_last_7d": result[2] if result else 0,
             "last_entry": result[3].isoformat() if result and result[3] else None
         }
-        
+
     except SQLAlchemyError as e:
         logger.error(f"Failed to get cache stats: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve cache statistics")
 
+
 @router.delete("/cache/{match_id}")
-def clear_cache_entry(match_id: str, db = Depends(get_db)):
-    """Clear a specific cache entry"""
+@rate_limiter.limit("30/minute")  # type: ignore
+def clear_cache_entry(request: Request, match_id: str, current_user: Dict[str, Any] = Depends(get_current_user), db = Depends(get_db), admin_user = Depends(admin_required)):
+    """Clear a specific cache entry (admin only)."""
+
     if db is None:
         raise HTTPException(status_code=503, detail="Database not available")
-    
+
     try:
         delete_query = text("DELETE FROM llm_analysis_cache WHERE match_id = :mid")
         result = db.execute(delete_query, {"mid": match_id})
         db.commit()
-        
-        if result.rowcount > 0:
+
+        if getattr(result, "rowcount", 0) > 0:
             logger.info(f"Cleared cache entry for match_id: {match_id}")
             return {"success": True, "message": f"Cleared cache for match_id: {match_id}"}
         else:
             return {"success": False, "message": "No cache entry found for this match_id"}
-            
+
     except SQLAlchemyError as e:
         logger.error(f"Failed to clear cache entry: {e}")
         db.rollback()

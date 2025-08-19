@@ -17,11 +17,16 @@ import numpy as np
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
 from app.db.database import get_db
+from fastapi import Depends, Request
+from app.middleware.rate_limiter import limiter
+from slowapi.util import get_remote_address
+from app.core.auth import get_current_user  
+rate_limit_decorator = limiter
 
 load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-MODEL_META_PATH = os.getenv("MODEL_META_PATH", "artifacts/20250814_141549.json")
+MODEL_META_PATH = os.getenv("MODEL_META_PATH")
 
 # module-level globals populated at startup
 MODEL = None
@@ -778,7 +783,8 @@ def predict_from_features_dict(features_dict: Dict[str, float]):
 
 # ---- endpoints ----
 @router.post("/match", response_model=PredictResponse)
-def predict_match(req: MatchRequest = Body(...), request: Request = None, db=Depends(get_db)):  # type: ignore
+@rate_limit_decorator.limit("120/minute")  # type: ignore
+def predict_match(req: MatchRequest = Body(...), request: Request = None, current_user: Dict[str, Any] = Depends(get_current_user), db=Depends(get_db)):  # type: ignore
     """
     Predict endpoint.
     - mode=auto or server: API computes features from DB then predicts.
