@@ -11,6 +11,7 @@ from sqlalchemy import text
 
 from app.db.database import get_db
 from app.core.auth import admin_required, get_current_user, JWT_SECRET, JWT_ALGORITHM
+from app.core.quota import create_default_quotas_for_user
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -142,6 +143,8 @@ def register_user(request_body: Dict[str, Any], db = Depends(get_db)):
     if not row:
         raise HTTPException(status_code=500, detail="User creation failed")
     user_id = row[0]
+
+    create_default_quotas_for_user(db, user_id, quota=10)
 
     # return a token for convenience
     payload = {"sub": str(user_id), "email": email, "is_admin": False}

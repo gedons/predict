@@ -22,6 +22,7 @@ from app.middleware.rate_limiter import limiter
 from slowapi.util import get_remote_address
 from app.core.auth import get_current_user  
 rate_limit_decorator = limiter
+from app.core.quota import quota_dependency
 
 load_dotenv()
 
@@ -784,7 +785,7 @@ def predict_from_features_dict(features_dict: Dict[str, float]):
 # ---- endpoints ----
 @router.post("/match", response_model=PredictResponse)
 @rate_limit_decorator.limit("120/minute")  # type: ignore
-def predict_match(req: MatchRequest = Body(...), request: Request = None, current_user: Dict[str, Any] = Depends(get_current_user), db=Depends(get_db)):  # type: ignore
+def predict_match(req: MatchRequest = Body(...), request: Request = None, current_user: Dict[str, Any] = Depends(get_current_user), db=Depends(get_db), _quota = Depends(quota_dependency("predict_match"))):  # type: ignore
     """
     Predict endpoint.
     - mode=auto or server: API computes features from DB then predicts.

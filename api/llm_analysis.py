@@ -1,6 +1,7 @@
 # app/api/llm_analysis.py
 from fastapi import APIRouter, Depends, HTTPException, status, Request
 from typing import Dict, Any, Optional, Union, Tuple
+from starlette.requests import Request as StarletteRequest
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from app.db.database import get_db
@@ -13,7 +14,8 @@ from pydantic import BaseModel, Field
 from datetime import datetime
 from app.core.auth import get_current_user, admin_required
 from app.middleware.rate_limiter import limiter as rate_limiter  # use limiter instance
-from slowapi.util import get_remote_address
+from app.core.quota import quota_dependency
+
 
 import joblib
 import xgboost as xgb
@@ -57,56 +59,129 @@ except Exception as e:
     logger.error(f"Unexpected error importing predict_match helper: {e}")
 
 
-def _get_base_prediction(match_request: Union[Dict[str, Any], MatchRequest]) -> Dict[str, Any]:
-    if predict_match_helper:
-        try:
-            # create compatible object if a dict was passed
-            if isinstance(match_request, dict):
-                request_obj = MatchRequest(
-                    home_team=match_request.get("home_team", ""),
-                    away_team=match_request.get("away_team", ""),
-                    date=match_request.get("date"),
-                    league=match_request.get("league"),
-                    venue=match_request.get("venue"),
-                    match_id=match_request.get("match_id"),
-                    extra_context=match_request.get("extra_context"),
-                    mode=match_request.get("mode", "auto"),
-                    features=match_request.get("features"),
-                    match_date=match_request.get("match_date") or match_request.get("date")
-                )
-            else:
-                request_obj = match_request
-                if not request_obj.match_date:
-                    request_obj.match_date = request_obj.date
+def _get_base_prediction(match_request: Union[Dict[str, Any], MatchRequest], request: Request = None) -> Dict[str, Any]: # type: ignore
+    """
+    Get base prediction without going through the rate-limited endpoint.
+    This directly calls the prediction logic to avoid dependency injection issues.
+    """
+    try:
+        # Create compatible object if a dict was passed
+        if isinstance(match_request, dict):
+            request_obj = MatchRequest(
+                home_team=match_request.get("home_team", ""),
+                away_team=match_request.get("away_team", ""),
+                date=match_request.get("date"),
+                league=match_request.get("league"),
+                venue=match_request.get("venue"),
+                match_id=match_request.get("match_id"),
+                extra_context=match_request.get("extra_context"),
+                mode=match_request.get("mode", "auto"),
+                features=match_request.get("features"),
+                match_date=match_request.get("match_date") or match_request.get("date")
+            )
+        else:
+            request_obj = match_request
+            if not request_obj.match_date:
+                request_obj.match_date = request_obj.date
 
-            base = predict_match_helper(request_obj, request=None)  # type: ignore
-            logger.info("Successfully got prediction from helper")
-            return base
-        except Exception as e:
-            logger.error(f"Prediction helper failed: {e}")
-            logger.error(traceback.format_exc())
-            raise HTTPException(status_code=500, detail=f"Prediction helper failed: {str(e)}")
-    else:
-        logger.warning("No prediction helper available, using mock data")
-        return {
-            "features": {
-                "home_shots_avg_5": 12.5,
-                "away_shots_avg_5": 10.2,
-                "form_diff": 0.3,
-                "home_goals_avg_5": 1.8,
-                "away_goals_avg_5": 1.2
-            },
-            "probabilities": {
-                "home": 0.45,
-                "draw": 0.30,
-                "away": 0.25
-            },
-            "model_meta": {
-                "model_version": "1.0",
-                "features_used": 15,
-                "confidence_score": 0.78
+        # Instead of calling the endpoint, let's import and use the underlying prediction logic
+        try:
+            # Import the necessary components from the predict module
+            from app.api.predict import (
+                MODEL_META, PREPROCESSOR, MODEL, 
+                build_feature_vector_from_db, 
+                predict_from_features_dict,
+                sanitize_for_json
+            )
+            
+            if MODEL_META is None or PREPROCESSOR is None or MODEL is None:
+                raise HTTPException(status_code=503, detail="Model not loaded yet")
+
+            # Handle different modes
+            mode = (request_obj.mode or "auto").lower()
+            if mode in ("auto", "server"):
+                features_dict = build_feature_vector_from_db(
+                    request_obj.home_team, 
+                    request_obj.away_team, 
+                    request_obj.match_date # type: ignore
+                )
+            elif mode == "features":
+                if not request_obj.features:
+                    raise HTTPException(status_code=400, detail="features payload required when mode='features'")
+                features_dict = {k: (None if v is None else float(v)) for k, v in request_obj.features.items()}
+                missing = [f for f in MODEL_META["features"] if f not in features_dict]
+                if missing:
+                    raise HTTPException(status_code=400, detail=f"Missing required feature keys: {missing}")
+            else:
+                raise HTTPException(status_code=400, detail="mode must be one of: auto|server|features")
+
+            # Get predictions
+            probs, implied, edge = predict_from_features_dict(features_dict) # type: ignore
+            
+            # Create match_id
+            match_id = f"{request_obj.match_date}_{request_obj.home_team.replace(' ', '')}_{request_obj.away_team.replace(' ', '')}"
+            
+            # Sanitize outputs
+            features_safe = sanitize_for_json(features_dict)
+            implied_safe = sanitize_for_json(implied)
+            edge_safe = sanitize_for_json(edge)
+            probs_safe = sanitize_for_json(probs)
+
+            # Build response in the same format as the endpoint
+            base = {
+                "match_id": match_id,
+                "features": features_safe,
+                "probabilities": probs_safe,
+                "implied_odds": {
+                    "home": implied_safe.get("home"), # type: ignore
+                    "draw": implied_safe.get("draw"), # type: ignore
+                    "away": implied_safe.get("away") # type: ignore
+                },
+                "edge": {
+                    "home": edge_safe.get("home"), # type: ignore
+                    "draw": edge_safe.get("draw"), # type: ignore
+                    "away": edge_safe.get("away") # type: ignore
+                },
+                "model_meta": {
+                    "created_at": MODEL_META.get("created_at"),
+                    "model_type": MODEL_META.get("model_type"),
+                    "n_train": MODEL_META.get("n_train"),
+                    "n_test": MODEL_META.get("n_test")
+                }
             }
-        }
+
+            logger.info("Successfully generated prediction using direct model access")
+            return base
+
+        except ImportError as e:
+            logger.error(f"Failed to import prediction components: {e}")
+            # Fall back to mock data if imports fail
+            logger.warning("Using mock prediction data due to import failure")
+            return {
+                "features": {
+                    "home_shots_avg_5": 12.5,
+                    "away_shots_avg_5": 10.2,
+                    "form_diff": 0.3,
+                    "home_goals_avg_5": 1.8,
+                    "away_goals_avg_5": 1.2
+                },
+                "probabilities": {
+                    "home": 0.45,
+                    "draw": 0.30,
+                    "away": 0.25
+                },
+                "model_meta": {
+                    "model_version": "1.0",
+                    "features_used": 15,
+                    "confidence_score": 0.78
+                }
+            }
+
+    except Exception as e:
+        logger.error(f"Prediction failed: {e}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
+
 
 
 def _validate_base_prediction(base: Dict[str, Any]) -> None:
@@ -229,6 +304,7 @@ def predict_enriched(
     current_user: Dict[str, Any] = Depends(get_current_user),
     db = Depends(get_db),
     use_cache: bool = True,
+    _quota = Depends(quota_dependency("predict_enriched")),
     force_refresh: bool = False
 ):
     """
@@ -240,7 +316,7 @@ def predict_enriched(
     start_time = datetime.utcnow()
     try:
         logger.info(f"Getting base prediction for {match_request.home_team} vs {match_request.away_team}")
-        base = _get_base_prediction(match_request)
+        base = _get_base_prediction(match_request, request)
         _validate_base_prediction(base)
 
         match_id = _generate_match_id(match_request)

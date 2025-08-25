@@ -8,6 +8,9 @@ from app.api.predict import router as predict_router, load_model_at_startup
 from app.api.admin_models import router as admin_models_router
 from app.api.auth import router as auth_router
 from app.api.llm_analysis import router as llm_router
+from app.api.quotas import router as quotas_router
+from app.api.admin_quotas import router as admin_quotas_router
+from app.api.admin_users import router as admin_users_router
 
 
 # from app.db.database import get_db
@@ -46,3 +49,6 @@ app.include_router(predict_router, prefix="/predict", tags=["predict"])
 app.include_router(admin_models_router)
 app.include_router(auth_router)
 app.include_router(llm_router)
+app.include_router(quotas_router)
+app.include_router(admin_quotas_router)
+app.include_router(admin_users_router)

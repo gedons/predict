@@ -8,6 +8,7 @@ from app.core.auth import admin_required
 from app.db.database import get_db
 from app.core.reload_pubsub import publish_model_reload
 
+
 router = APIRouter(prefix="/admin/models", tags=["admin_models"])
 
 
@@ -159,7 +160,6 @@ def deactivate_model(model_id: int, current_user: Dict = Depends(admin_required)
 
     return {"status": "deactivated", "model_id": model_id, "deactivated_by": current_user.get("email")}
 
-
 @router.post("/{model_id}/reload", dependencies=[Depends(admin_required)])
 def reload_model(model_id: int, db=Depends(get_db)):
     """
@@ -185,3 +185,17 @@ def reload_model(model_id: int, db=Depends(get_db)):
         print(f"Warning: publish_model_reload failed after reload_model: {e}")
 
     return {"status": "reloaded", "model_id": model_id}
+
+
+    """
+    Grant default quotas to a user (useful after registering).
+    Payload: {"user_id": "...", "quota": 10 }
+    """
+    user_id = payload.get("user_id")
+    quota = int(payload.get("quota", 10))
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id required")
+    ok = create_default_quotas_for_user(db, user_id=user_id, quota=quota)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to create default quotas")
+    return {"status": "ok", "user_id": user_id, "granted_quota": quota}
