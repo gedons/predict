@@ -11,7 +11,8 @@ from app.api.llm_analysis import router as llm_router
 from app.api.quotas import router as quotas_router
 from app.api.admin_quotas import router as admin_quotas_router
 from app.api.admin_users import router as admin_users_router
-
+from app.api.admin_summary import router as admin_summary_router
+from app.api.admin_analytics import router as admin_analytics_router
 
 # from app.db.database import get_db
 
@@ -52,3 +53,5 @@ app.include_router(llm_router)
 app.include_router(quotas_router)
 app.include_router(admin_quotas_router)
 app.include_router(admin_users_router)
+app.include_router(admin_summary_router)
+app.include_router(admin_analytics_router)

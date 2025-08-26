@@ -1,4 +1,5 @@
 # app/api/predict.py
+from datetime import datetime
 import json
 import math
 import os
@@ -23,6 +24,7 @@ from slowapi.util import get_remote_address
 from app.core.auth import get_current_user  
 rate_limit_decorator = limiter
 from app.core.quota import quota_dependency
+from app.core.analytics import capture_event
 
 load_dotenv()
 
@@ -751,7 +753,7 @@ def predict_from_features_dict(features_dict: Dict[str, float]):
         dmat = xgb.DMatrix(pd.DataFrame(X_prep, columns=feature_names), feature_names=feature_names)
         probs_arr = BOOSTER.predict(dmat)[0]  # type: ignore
 
-    probs = {"home": float(probs_arr[0]), "draw": float(probs_arr[1]), "away": float(probs_arr[2])}
+    probs = {"home": float(probs_arr[0]), "draw": float(probs_arr[1]), "away": float(probs_arr[2])} # type: ignore
 
     implied_home = features_dict.get("home_prob_implied")
     implied_draw = features_dict.get("draw_prob_implied")
@@ -783,24 +785,26 @@ def predict_from_features_dict(features_dict: Dict[str, float]):
 
 
 # ---- endpoints ----
+
 @router.post("/match", response_model=PredictResponse)
 @rate_limit_decorator.limit("120/minute")  # type: ignore
-def predict_match(req: MatchRequest = Body(...), request: Request = None, current_user: Dict[str, Any] = Depends(get_current_user), db=Depends(get_db), _quota = Depends(quota_dependency("predict_match"))):  # type: ignore
-    """
-    Predict endpoint.
-    - mode=auto or server: API computes features from DB then predicts.
-    - mode=features: caller supplies features dict (must match MODEL_META['features']).
-    """
+def predict_match(
+    req: MatchRequest = Body(...),
+    request: Request = None,   # type: ignore
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db=Depends(get_db),
+    _quota = Depends(quota_dependency("predict_match")),  # type: ignore
+):
     if MODEL_META is None or PREPROCESSOR is None or MODEL is None:
         raise HTTPException(status_code=503, detail="Model not loaded yet")
 
     mode = (req.mode or "auto").lower()
+
     if mode in ("auto", "server"):
         features_dict = build_feature_vector_from_db(req.home_team, req.away_team, req.match_date)
     elif mode == "features":
         if not req.features:
             raise HTTPException(status_code=400, detail="features payload required when mode='features'")
-        # allow optional numeric values, coerce where possible
         features_dict = {k: (None if v is None else float(v)) for k, v in req.features.items()}
         missing = [f for f in MODEL_META["features"] if f not in features_dict]
         if missing:
@@ -808,10 +812,14 @@ def predict_match(req: MatchRequest = Body(...), request: Request = None, curren
     else:
         raise HTTPException(status_code=400, detail="mode must be one of: auto|server|features")
 
+    # perform prediction
     probs, implied, edge = predict_from_features_dict(features_dict)  # type: ignore
 
-    match_id = f"{req.match_date}_{req.home_team.replace(' ', '')}_{req.away_team.replace(' ', '')}"
-    # sanitize the pieces before returning
+    # create match_id sanitized
+    md = req.match_date or datetime.utcnow().strftime("%Y-%m-%d")
+    match_id = f"{md}_{req.home_team.replace(' ', '')}_{req.away_team.replace(' ', '')}"
+
+    # sanitize and prepare response
     features_safe = sanitize_for_json(features_dict)
     implied_safe = sanitize_for_json(implied)
     edge_safe = sanitize_for_json(edge)
@@ -821,14 +829,22 @@ def predict_match(req: MatchRequest = Body(...), request: Request = None, curren
         "match_id": match_id,
         "features": features_safe,
         "probabilities": probs_safe,
-        "implied_odds": {"home": implied_safe.get("home"), "draw": implied_safe.get("draw"), "away": implied_safe.get("away")}, # type: ignore
-        "edge": {"home": edge_safe.get("home"), "draw": edge_safe.get("draw"), "away": edge_safe.get("away")}, # type: ignore
+        "implied_odds": {
+            "home": implied_safe.get("home"), # type: ignore
+            "draw": implied_safe.get("draw"), # type: ignore
+            "away": implied_safe.get("away"), # type: ignore # type: ignore
+        },  # type: ignore
+        "edge": {
+            "home": edge_safe.get("home"), # type: ignore
+            "draw": edge_safe.get("draw"),  # type: ignore
+            "away": edge_safe.get("away"),  # type: ignore
+        },  # type: ignore
         "model_meta": {
             "created_at": MODEL_META.get("created_at"),
             "model_type": MODEL_META.get("model_type"),
             "n_train": MODEL_META.get("n_train"),
-            "n_test": MODEL_META.get("n_test")
-        }
+            "n_test": MODEL_META.get("n_test"),
+        },
     }
 
     # find active model id (best-effort)
@@ -843,6 +859,7 @@ def predict_match(req: MatchRequest = Body(...), request: Request = None, curren
     except Exception as e:
         print("Warning: cannot read active model from DB:", e)
 
+    # log prediction
     client_ip = None
     try:
         client_ip = request.client.host if request and request.client else None
@@ -850,10 +867,33 @@ def predict_match(req: MatchRequest = Body(...), request: Request = None, curren
         client_ip = None
 
     user_id = None
+    if current_user:
+        user_id = current_user.get("id") if isinstance(current_user, dict) else None
 
     try:
         log_prediction(db, resp, model_id=model_id, client_ip=client_ip, user_id=user_id)  # type: ignore
     except Exception as e:
         print("Warning: log_prediction raised:", e)
 
+    # Analytics event (best-effort, non-blocking)
+    try:
+        capture_event(
+            event="prediction_requested",
+            properties={
+                "match_id": match_id,
+                "home_team": req.home_team,
+                "away_team": req.away_team,
+                "mode": mode,
+                "prob_home": float(probs_safe.get("home") or 0.0),  # type: ignore
+                "prob_draw": float(probs_safe.get("draw") or 0.0),  # type: ignore
+                "prob_away": float(probs_safe.get("away") or 0.0),  # type: ignore
+                "model_id": model_id,
+            },
+            request=request
+        )
+    except Exception:
+        # already logged inside capture_event; swallow
+        pass
+
     return resp
+

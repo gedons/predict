@@ -8,6 +8,7 @@ from app.db.database import get_db
 from app.services.context_builder import build_match_context
 from app.services.llm_service import call_gemini, LLMServiceError
 import json
+import time
 import traceback
 import logging
 from pydantic import BaseModel, Field
@@ -15,6 +16,7 @@ from datetime import datetime
 from app.core.auth import get_current_user, admin_required
 from app.middleware.rate_limiter import limiter as rate_limiter  # use limiter instance
 from app.core.quota import quota_dependency
+from app.core.analytics import capture_event
 
 
 import joblib
@@ -372,8 +374,34 @@ def predict_enriched(
         try:
             llm_raw, llm_parsed = call_gemini(prompt)
             logger.info("Successfully generated LLM analysis")
+             # analytics success
+            capture_event(
+                event="llm_enrichment_completed",
+                properties={
+                    "match_id": match_id,
+                    "home_team": match_request.home_team,
+                    "away_team": match_request.away_team,
+                    "prob_home": float(base["probabilities"]["home"]),
+                    "prob_draw": float(base["probabilities"]["draw"]),
+                    "prob_away": float(base["probabilities"]["away"]),
+                    # "llm_latency_ms": llm_latency_ms,
+                    "used_cache": bool(cached_result),
+                },
+                request=request
+            )
         except Exception as e:
             logger.error(f"LLM analysis failed: {e}")
+            capture_event(
+                event="llm_enrichment_failed",
+                properties={
+                    "match_id": match_id,
+                    "home_team": match_request.home_team,
+                    "away_team": match_request.away_team,
+                    # "llm_latency_ms": llm_latency_ms,
+                    "error_short": str(e)[:200],
+                },
+                request=request
+            )
             processing_time = int((datetime.utcnow() - start_time).total_seconds() * 1000)
             return PredictionResponse(
                 model=base,
