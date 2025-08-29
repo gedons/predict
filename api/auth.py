@@ -144,7 +144,7 @@ def register_user(request_body: Dict[str, Any], db = Depends(get_db)):
         raise HTTPException(status_code=500, detail="User creation failed")
     user_id = row[0]
 
-    create_default_quotas_for_user(db, user_id, quota=10)
+    create_default_quotas_for_user(db, user_id, quota=10, q_limit=10)
 
     # return a token for convenience
     payload = {"sub": str(user_id), "email": email, "is_admin": False}

@@ -9,22 +9,23 @@ from app.db.database import get_db
 from app.core.auth import get_current_user
 
 DEFAULT_QUOTA_PER_ENDPOINT = 10
+DEFAULT_QUOTA_LIMIT_PER_ENDPOINT = 10
 DEFAULT_ENDPOINTS = ["predict_match", "predict_enriched"]
 
 def _now_sql():
     return datetime.utcnow()
 
-def create_default_quotas_for_user(db, user_id: str, quota: int = DEFAULT_QUOTA_PER_ENDPOINT, endpoints: Optional[list] = None):
+def create_default_quotas_for_user(db, user_id: str, quota: int = DEFAULT_QUOTA_PER_ENDPOINT, q_limit: int = DEFAULT_QUOTA_LIMIT_PER_ENDPOINT, endpoints: Optional[list] = None):
     """Create default quotas for a newly registered user."""
     if endpoints is None:
         endpoints = DEFAULT_ENDPOINTS
     try:
         for ep in endpoints:
             db.execute(text("""
-                INSERT INTO user_quotas (user_id, endpoint, remaining, unlimited, created_at, updated_at)
-                VALUES (:uid, :ep, :remaining, false, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                INSERT INTO user_quotas (user_id, endpoint, remaining, quota_limit, unlimited, created_at, updated_at)
+                VALUES (:uid, :ep, :remaining, :quota_limit, false, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                 ON CONFLICT (user_id, endpoint) DO NOTHING
-            """), {"uid": str(user_id), "ep": ep, "remaining": int(quota)})
+            """), {"uid": str(user_id), "ep": ep, "remaining": int(quota), "quota_limit": int(q_limit)})
         db.commit()
         return True
     except SQLAlchemyError:
@@ -78,11 +79,11 @@ def get_quota(db, user_id: str, endpoint: Optional[str] = None):
     """
     try:
         if endpoint:
-            q = db.execute(text("SELECT user_id, endpoint, remaining, unlimited, created_at, updated_at FROM user_quotas WHERE user_id = :uid AND endpoint = :endpoint"),
+            q = db.execute(text("SELECT user_id, endpoint, remaining, unlimited, quota_limit, created_at, updated_at FROM user_quotas WHERE user_id = :uid AND endpoint = :endpoint"),
                            {"uid": str(user_id), "endpoint": endpoint}).fetchone()
             return dict(q) if q else None
         else:
-            rows = db.execute(text("SELECT user_id, endpoint, remaining, unlimited, created_at, updated_at FROM user_quotas WHERE user_id = :uid"),
+            rows = db.execute(text("SELECT user_id, endpoint, remaining, unlimited, quota_limit, created_at, updated_at FROM user_quotas WHERE user_id = :uid"),
                               {"uid": str(user_id)}).fetchall()
             return [dict(r) for r in rows]
     except SQLAlchemyError as e:
