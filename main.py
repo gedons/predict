@@ -2,18 +2,18 @@ from fastapi import FastAPI, Depends
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from fastapi.middleware.cors import CORSMiddleware
-from app.middleware.rate_limiter import init_rate_limiter
-from app.middleware.auth_middleware import TokenPayloadMiddleware
-from app.api.predict import router as predict_router, load_model_at_startup
-from app.api.admin_models import router as admin_models_router
-from app.api.auth import router as auth_router
-from app.api.llm_analysis import router as llm_router
-from app.api.quotas import router as quotas_router
-from app.api.admin_quotas import router as admin_quotas_router
-from app.api.admin_users import router as admin_users_router
-from app.api.admin_summary import router as admin_summary_router
-from app.api.admin_analytics import router as admin_analytics_router
-from app.api.external import router as external_router
+from middleware.rate_limiter import init_rate_limiter
+from middleware.auth_middleware import TokenPayloadMiddleware
+from api.predict import router as predict_router, load_model_at_startup
+from api.admin_models import router as admin_models_router
+from api.auth import router as auth_router
+from api.llm_analysis import router as llm_router
+from api.quotas import router as quotas_router
+from api.admin_quotas import router as admin_quotas_router
+from api.admin_users import router as admin_users_router
+from api.admin_summary import router as admin_summary_router
+from api.admin_analytics import router as admin_analytics_router
+from api.external import router as external_router
 
 
 
