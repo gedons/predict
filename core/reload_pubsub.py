@@ -4,8 +4,8 @@ import threading
 import time
 from typing import Optional
 
-from app.core.redis_client import redis_client
-from app.api.predict import load_model_by_id 
+from core.redis_client import redis_client
+from api.predict import load_model_by_id 
 
 CHANNEL = "model_reload"
 

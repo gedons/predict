@@ -4,8 +4,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from typing import Dict, Any
 from datetime import datetime, timedelta
 
-from app.core.auth import admin_required
-from app.db.database import get_db
+from core.auth import admin_required
+from db.database import get_db
 
 router = APIRouter(prefix="/admin", tags=["admin_summary"])
 

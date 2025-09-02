@@ -17,14 +17,14 @@ import pandas as pd
 import numpy as np
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
-from app.db.database import get_db
+from db.database import get_db
 from fastapi import Depends, Request
-from app.middleware.rate_limiter import limiter
+from middleware.rate_limiter import limiter
 from slowapi.util import get_remote_address
-from app.core.auth import get_current_user  
+from core.auth import get_current_user  
 rate_limit_decorator = limiter
-from app.core.quota import quota_dependency
-from app.core.analytics import capture_event
+from core.quota import quota_dependency
+from core.analytics import capture_event
 
 load_dotenv()
 

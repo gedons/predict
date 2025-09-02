@@ -5,8 +5,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from fastapi import Depends, HTTPException, status
 from datetime import datetime
 import json
-from app.db.database import get_db
-from app.core.auth import get_current_user
+from db.database import get_db
+from core.auth import get_current_user
 
 DEFAULT_QUOTA_PER_ENDPOINT = 10
 DEFAULT_QUOTA_LIMIT_PER_ENDPOINT = 10

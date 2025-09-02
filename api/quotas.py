@@ -5,8 +5,8 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from datetime import datetime
 
-from app.core.auth import get_current_user
-from app.db.database import get_db
+from core.auth import get_current_user
+from db.database import get_db
 
 router = APIRouter(prefix="/me", tags=["me"])
 

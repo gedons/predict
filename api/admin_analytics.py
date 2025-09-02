@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from typing import Dict, Any
 import os
 import requests
-from app.core.auth import admin_required
+from core.auth import admin_required
 
 router = APIRouter(prefix="/admin/analytics", tags=["admin_analytics"])
 

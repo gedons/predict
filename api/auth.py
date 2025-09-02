@@ -9,9 +9,9 @@ from jose import jwt
 from passlib.context import CryptContext
 from sqlalchemy import text
 
-from app.db.database import get_db
-from app.core.auth import admin_required, get_current_user, JWT_SECRET, JWT_ALGORITHM
-from app.core.quota import create_default_quotas_for_user
+from db.database import get_db
+from core.auth import admin_required, get_current_user, JWT_SECRET, JWT_ALGORITHM
+from core.quota import create_default_quotas_for_user
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 

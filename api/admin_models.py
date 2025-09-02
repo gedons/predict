@@ -4,9 +4,9 @@ from typing import Dict, Any, Optional
 from sqlalchemy import text
 import json
 
-from app.core.auth import admin_required
-from app.db.database import get_db
-from app.core.reload_pubsub import publish_model_reload
+from core.auth import admin_required
+from db.database import get_db
+from core.reload_pubsub import publish_model_reload
 
 
 router = APIRouter(prefix="/admin/models", tags=["admin_models"])

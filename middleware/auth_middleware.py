@@ -2,7 +2,7 @@
 from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware
 from typing import Callable
-from app.core.auth import decode_jwt   
+from core.auth import decode_jwt   
 import os
 
 class TokenPayloadMiddleware(BaseHTTPMiddleware):

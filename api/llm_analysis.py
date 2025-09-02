@@ -4,19 +4,19 @@ from typing import Dict, Any, Optional, Union, Tuple
 from starlette.requests import Request as StarletteRequest
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
-from app.db.database import get_db
-from app.services.context_builder import build_match_context
-from app.services.llm_service import call_gemini, LLMServiceError
+from db.database import get_db
+from services.context_builder import build_match_context
+from services.llm_service import call_gemini, LLMServiceError
 import json
 import time
 import traceback
 import logging
 from pydantic import BaseModel, Field
 from datetime import datetime
-from app.core.auth import get_current_user, admin_required
-from app.middleware.rate_limiter import limiter as rate_limiter  # use limiter instance
-from app.core.quota import quota_dependency
-from app.core.analytics import capture_event
+from core.auth import get_current_user, admin_required
+from middleware.rate_limiter import limiter as rate_limiter  # use limiter instance
+from core.quota import quota_dependency
+from core.analytics import capture_event
 
 
 import joblib

@@ -4,8 +4,8 @@ from typing import List, Dict, Any, Optional
 from sqlalchemy import text
 import json
 
-from app.core.auth import admin_required
-from app.db.database import get_db
+from core.auth import admin_required
+from db.database import get_db
 
 router = APIRouter(prefix="/admin/users", tags=["admin_users"])
 
