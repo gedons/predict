@@ -1,88 +1,173 @@
-# app/api/external.py
+# app/api/external_sportradar.py
 import os
+import requests
 import json
-from pathlib import Path
-from typing import Optional
-from datetime import datetime, timedelta
+from urllib.parse import quote
+from fastapi import APIRouter, Query, HTTPException
+from typing import Any, Dict, List, Tuple
 
-from fastapi import APIRouter, HTTPException, Query
-import httpx
+router = APIRouter(prefix="/external/sportradar", tags=["external_sportradar"])
 
-CACHE_DIR = Path("app/tmp")
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
+SPORTRADAR_KEY = os.getenv("SPORTRADAR_KEY")
+SPORTRADAR_BASE = os.getenv("SPORTRADAR_BASE", "/soccer/trial/v4/en")
+SPORTRADAR_HOST = os.getenv("SPORTRADAR_HOST", "https://api.sportradar.com")
+SPORTRADAR_SEASON_ID = os.getenv("SPORTRADAR_SEASON_ID")  # optional default season id
 
-router = APIRouter(prefix="/external", tags=["external"])
-
-SPORTRADAR_KEY = os.getenv("SPORTRADAR_API_KEY") or os.getenv("VITE_SPORTRADAR_API_KEY") or os.getenv("SPORTRADAR_API")
-SPORTRADAR_BASE = "https://api.sportradar.com/soccer/trial/v4/en"
-
-# Cache TTL in seconds (configurable via env)
-CACHE_TTL_SECONDS = int(os.getenv("SPORTRADAR_CACHE_TTL", "600"))  # 10 minutes default
-
-
-def _cache_path(competition_id: str):
-    safe = competition_id.replace("/", "_").replace(":", "_")
-    return CACHE_DIR / f"sportradar_{safe}.json"
-
-
-async def _fetch_sportradar(url: str, params: dict = None) -> dict: # type: ignore
-    timeout = httpx.Timeout(15.0, connect=10.0)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        r = await client.get(url, params=params)
-        r.raise_for_status()
-        return r.json()
+def _http_get(url: str, params: dict = None, timeout: int = 10) -> Tuple[int, Any, str]: # type: ignore
+    try:
+        r = requests.get(url, params=params or {}, timeout=timeout)
+        text = r.text
+        try:
+            data = r.json()
+        except Exception:
+            data = text
+        return r.status_code, data, text
+    except requests.RequestException as e:
+        return 0, None, str(e)
 
 
-@router.get("/sportradar/schedules")
-async def get_sportradar_schedules(
-    competition_id: str = Query("sr:competition:17", description="Sportradar competition id, default EPL sr:competition:17"),
-    force_refresh: bool = Query(False, description="Force refresh ignoring cache"),
+def _dict_contains_value(obj: Any, value: str) -> bool:
+    if obj is None:
+        return False
+    if isinstance(obj, str):
+        return value in obj
+    if isinstance(obj, dict):
+        for v in obj.values():
+            if _dict_contains_value(v, value):
+                return True
+        return False
+    if isinstance(obj, list):
+        for item in obj:
+            if _dict_contains_value(item, value):
+                return True
+        return False
+    return False
+
+
+def _pull_possible_matches(obj: Any) -> List[Dict[str, Any]]:
+    found = []
+
+    def _walk(x):
+        if isinstance(x, dict):
+            keys = set(k.lower() for k in x.keys())
+            if ("home" in keys and "away" in keys) or "competitors" in keys or "sport_event" in keys or "scheduled" in keys or "start_time" in keys:
+                found.append(x)
+            for v in x.values():
+                _walk(v)
+        elif isinstance(x, list):
+            for it in x:
+                _walk(it)
+        else:
+            return
+
+    _walk(obj)
+    return found
+
+
+def _normalize_match_obj(raw: Dict[str, Any]) -> Dict[str, Any]:
+    mid = raw.get("id") or raw.get("match_id") or raw.get("sport_event_id") or raw.get("game_id")
+    scheduled = raw.get("scheduled") or raw.get("start_time") or raw.get("start")
+    home = ""
+    away = ""
+    if "home" in raw and "away" in raw:
+        h = raw.get("home"); a = raw.get("away")
+        home = (h.get("name") if isinstance(h, dict) else h) or ""
+        away = (a.get("name") if isinstance(a, dict) else a) or ""
+    elif "competitors" in raw and isinstance(raw["competitors"], list):
+        comps = raw["competitors"]
+        if len(comps) > 0:
+            home = comps[0].get("name") or comps[0].get("id") or ""
+        if len(comps) > 1:
+            away = comps[1].get("name") or comps[1].get("id") or ""
+    elif "sport_event" in raw and isinstance(raw["sport_event"], dict):
+        se = raw["sport_event"]
+        if "competitors" in se and isinstance(se["competitors"], list):
+            comps = se["competitors"]
+            if len(comps) > 0:
+                home = comps[0].get("name") or comps[0].get("id") or ""
+            if len(comps) > 1:
+                away = comps[1].get("name") or comps[1].get("id") or ""
+        home = home or se.get("home", "") or se.get("home_team", "")
+        away = away or se.get("away", "") or se.get("away_team", "")
+    else:
+        home = raw.get("home_team") or raw.get("home_name") or ""
+        away = raw.get("away_team") or raw.get("away_name") or ""
+
+    try:
+        home = (home.get("name") if isinstance(home, dict) else home) or ""
+    except Exception:
+        home = str(home or "")
+    try:
+        away = (away.get("name") if isinstance(away, dict) else away) or ""
+    except Exception:
+        away = str(away or "")
+
+    return {"id": mid, "home_team": home, "away_team": away, "scheduled": scheduled, "raw": raw}
+
+
+@router.get("/season_schedules")
+def season_schedules(
+    season_id: str = Query(None, description="Season id, e.g. sr:season:118689"),
+    competition_id: str = Query("sr:competition:17", description="Competition id to filter by (EPL default)")
 ):
     """
-    Proxy endpoint to fetch schedules from Sportradar for a competition.
-    Example: GET /external/sportradar/schedules?competition_id=sr:competition:17
-    This endpoint caches results (default TTL configurable via SPORTRADAR_CACHE_TTL).
+    Fetch season schedules and return only matches belonging to the requested competition_id.
+    If season_id is not provided, will fall back to SPORTRADAR_SEASON_ID env variable.
     """
     if not SPORTRADAR_KEY:
-        raise HTTPException(status_code=500, detail="Sportradar API key not configured on server (SPORTRADAR_API_KEY)")
+        raise HTTPException(status_code=500, detail="SPORTRADAR_KEY not configured on server.")
 
-    cache_file = _cache_path(competition_id)
+    # If no season_id in query, try env fallback
+    if not season_id:
+        season_id = "sr:season:118689"   # type: ignore
 
-    # return cache if valid and not forced
-    if cache_file.exists() and not force_refresh:
-        try:
-            with open(cache_file, "r", encoding="utf-8") as f:
-                payload = json.load(f)
-            ts = payload.get("_fetched_at")
-            if ts:
-                fetched_at = datetime.fromisoformat(ts)
-                if datetime.utcnow() - fetched_at < timedelta(seconds=CACHE_TTL_SECONDS):
-                    # return cached content (strip internal metadata)
-                    res = payload.get("data", payload)
-                    return {"cached": True, "fetched_at": ts, "data": res}
-        except Exception:
-            # ignore cache errors and re-fetch
-            pass
+    if not season_id:
+        raise HTTPException(status_code=400, detail={
+            "message": "season_id query parameter is required (or set SPORTRADAR_SEASON_ID env var).",
+            "example": "/external/sportradar/season_schedules?season_id=sr:season:118689&competition_id=sr:competition:17"
+        })
 
-    # Build Sportradar URL
-    url = f"{SPORTRADAR_BASE}/competitions/{competition_id}/schedules.json"
+    season_id_enc = quote(season_id, safe="")
+    base = SPORTRADAR_HOST.rstrip("/") + SPORTRADAR_BASE.rstrip("/")
+    url = f"{base}/seasons/{season_id_enc}/schedules.json"
     params = {"api_key": SPORTRADAR_KEY}
 
-    try:
-        data = await _fetch_sportradar(url, params=params)
-    except httpx.HTTPStatusError as exc:
-        detail = f"Sportradar returned {exc.response.status_code}: {exc.response.text[:300]}"
-        raise HTTPException(status_code=502, detail=detail)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to contact Sportradar: {str(exc)}")
+    status, data, raw = _http_get(url, params=params)
+    if status != 200:
+        raise HTTPException(status_code=max(status or 500, 400), detail={
+            "message": f"Sportradar returned {status}: {raw[:500] if raw else ''}",
+            "url": url
+        })
 
-    # Save to cache with fetched timestamp
-    try:
-        wrapped = {"_fetched_at": datetime.utcnow().isoformat(), "data": data}
-        with open(cache_file, "w", encoding="utf-8") as f:
-            json.dump(wrapped, f)
-    except Exception:
-        # ignore cache write errors
-        pass
+    candidate_matches = _pull_possible_matches(data)
+    filtered = [cm for cm in candidate_matches if _dict_contains_value(cm, competition_id)]
 
-    return {"cached": False, "fetched_at": datetime.utcnow().isoformat(), "data": data}
+    if not filtered:
+        # fallback: find schedule blocks containing the competition_id and collect matches from them
+        def find_blocks_with_comp(obj):
+            results = []
+            if isinstance(obj, dict):
+                if _dict_contains_value(obj, competition_id):
+                    results.append(obj)
+                for v in obj.values():
+                    results.extend(find_blocks_with_comp(v))
+            elif isinstance(obj, list):
+                for it in obj:
+                    results.extend(find_blocks_with_comp(it))
+            return results
+
+        matches_from_blocks = []
+        blocks = find_blocks_with_comp(data)
+        for block in blocks:
+            matches_from_blocks.extend(_pull_possible_matches(block))
+        seen = set()
+        for m in matches_from_blocks:
+            mid = m.get("id") or m.get("match_id") or json.dumps(m)[:80]
+            if mid not in seen:
+                filtered.append(m)
+                seen.add(mid)
+
+    normalized = [_normalize_match_obj(m) for m in filtered]
+    normalized_sorted = sorted(normalized, key=lambda x: x.get("scheduled") or "")
+
+    return {"season_id": season_id, "competition_id": competition_id, "count": len(normalized_sorted), "matches": normalized_sorted}
