@@ -53,7 +53,7 @@ class PredictionResponse(BaseModel):
 # Try to import existing predict function with better error handling
 predict_match_helper = None
 try:
-    from app.api.predict import predict_match as predict_match_helper  # type: ignore
+    from api.predict import predict_match as predict_match_helper  # type: ignore
     logger.info("Successfully imported predict_match helper")
 except ImportError as e:
     logger.warning(f"Could not import predict_match helper: {e}")
@@ -89,7 +89,7 @@ def _get_base_prediction(match_request: Union[Dict[str, Any], MatchRequest], req
         # Instead of calling the endpoint, let's import and use the underlying prediction logic
         try:
             # Import the necessary components from the predict module
-            from app.api.predict import (
+            from api.predict import (
                 MODEL_META, PREPROCESSOR, MODEL, 
                 build_feature_vector_from_db, 
                 predict_from_features_dict,
