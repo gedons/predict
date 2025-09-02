@@ -11,7 +11,7 @@ router = APIRouter(prefix="/external/sportradar", tags=["external_sportradar"])
 SPORTRADAR_KEY = os.getenv("SPORTRADAR_KEY")
 SPORTRADAR_BASE = os.getenv("SPORTRADAR_BASE", "/soccer/trial/v4/en")
 SPORTRADAR_HOST = os.getenv("SPORTRADAR_HOST", "https://api.sportradar.com")
-SPORTRADAR_SEASON_ID = os.getenv("SPORTRADAR_SEASON_ID")  # optional default season id
+SPORTRADAR_SEASON_ID = os.getenv("SPORTRADAR_SEASON_ID") 
 
 def _http_get(url: str, params: dict = None, timeout: int = 10) -> Tuple[int, Any, str]: # type: ignore
     try:
